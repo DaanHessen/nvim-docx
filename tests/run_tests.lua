@@ -14,17 +14,26 @@ end
 
 local tests = {}
 local test_dir = "/tmp/nvim-docx-e2e-tests"
+local fixtures_dir = vim.fn.fnamemodify(debug.getinfo(1).source:sub(2), ":p:h") .. "/fixtures"
 
 local function setup_env()
   vim.fn.delete(test_dir, "rf")
   vim.fn.mkdir(test_dir, "p")
   vim.fn.mkdir(test_dir .. "/assets", "p")
 
+  -- Generate valid PNG using pure Python standard library (no pip / Pillow dependency)
   local python_cmd = string.format([[
 python3 -c "
-from PIL import Image
-img = Image.new('RGB', (80, 80), color=(100, 150, 200))
-img.save('%s/assets/logo.png')
+import struct, zlib
+sig = b'\x89PNG\r\n\x1a\n'
+ihdr_data = struct.pack('>IIBBBBB', 16, 16, 8, 2, 0, 0, 0)
+ihdr = struct.pack('>I', len(ihdr_data)) + b'IHDR' + ihdr_data + struct.pack('>I', zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff)
+raw = b''.join(b'\x00' + b'\x1f\x4a\x8c' * 16 for _ in range(16))
+comp = zlib.compress(raw)
+idat = struct.pack('>I', len(comp)) + b'IDAT' + comp + struct.pack('>I', zlib.crc32(b'IDAT' + comp) & 0xffffffff)
+iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', zlib.crc32(b'IEND') & 0xffffffff)
+with open('%s/assets/logo.png', 'wb') as f:
+    f.write(sig + ihdr + idat + iend)
 "
 ]], test_dir)
   vim.fn.system(python_cmd)
@@ -126,36 +135,120 @@ tests["open_edit_save_rich_docx"] = function()
   vim.cmd("bdelete!")
 end
 
--- Test 4: Real Microsoft Word 2007+ document
-tests["real_word_document_roundtrip"] = function()
-  if vim.fn.filereadable("/tmp/sample_real.docx") ~= 1 then
-    print("Skipping real word doc test (file not found)")
-    return
-  end
+-- Test 4: Physical Microsoft Word document with embedded images
+tests["physical_docx_with_embedded_images"] = function()
+  local src_fixture = fixtures_dir .. "/having-images.docx"
+  assert_true(vim.fn.filereadable(src_fixture) == 1, "having-images.docx fixture exists")
 
-  local sample_copy = test_dir .. "/real_sample_test.docx"
-  vim.fn.system(string.format("cp /tmp/sample_real.docx %s", vim.fn.shellescape(sample_copy)))
+  local test_copy = test_dir .. "/test_having_images.docx"
+  vim.fn.system(string.format("cp %s %s", vim.fn.shellescape(src_fixture), vim.fn.shellescape(test_copy)))
 
-  vim.cmd("edit " .. vim.fn.fnameescape(sample_copy))
+  -- Initial check: verify source fixture has media
+  local initial_unzip = vim.fn.system("unzip -l " .. vim.fn.shellescape(test_copy))
+  assert_true(initial_unzip:find("image1%.png") ~= nil, "Fixture contains image1.png")
+  assert_true(initial_unzip:find("image2%.png") ~= nil, "Fixture contains image2.png")
+
+  -- Open in Neovim
+  vim.cmd("edit " .. vim.fn.fnameescape(test_copy))
   local bufnr = vim.api.nvim_get_current_buf()
 
   assert_equal(vim.bo[bufnr].filetype, "markdown", "filetype is markdown")
   assert_equal(vim.bo[bufnr].buftype, "acwrite", "buftype is acwrite")
 
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  table.insert(lines, "# Additional Heading by Test")
+
+  -- Verify extracted media images are referenced in Markdown
+  local text = table.concat(lines, "\n")
+  assert_true(text:find("media") ~= nil, "Extracted media referenced in markdown buffer: " .. text)
+
+  -- Edit buffer: add custom heading and text
+  table.insert(lines, 1, "# Customized Heading in Image Document")
+  table.insert(lines, 2, "Verified that images remain intact after editing.")
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 
+  -- Save
   vim.cmd("write")
-  assert_equal(vim.bo[bufnr].modified, false, "modified is false after write")
+  assert_equal(vim.bo[bufnr].modified, false, "modified is false after saving")
 
-  local check_out = vim.fn.system("pandoc " .. vim.fn.shellescape(sample_copy) .. " -t plain")
-  assert_true(check_out:find("Additional Heading by Test") ~= nil, "Pandoc can read modified real docx")
+  -- Verify images are STILL present in the saved DOCX zip archive
+  local saved_unzip = vim.fn.system("unzip -l " .. vim.fn.shellescape(test_copy))
+  assert_true(saved_unzip:find("word/media/image") ~= nil, "Media folder preserved in saved docx: " .. saved_unzip)
+
+  -- Re-open in Neovim to verify roundtrip fidelity
+  vim.cmd("edit!")
+  local reloaded_lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local reloaded_text = table.concat(reloaded_lines, "\n")
+  assert_true(reloaded_text:find("Customized Heading in Image Document") ~= nil, "Reloaded buffer has edited heading")
+  assert_true(reloaded_text:find("media") ~= nil, "Reloaded buffer retains image references")
 
   vim.cmd("bdelete!")
 end
 
--- Test 5: Special characters in filename
+-- Test 5: Physical Microsoft Word document with custom styles and fonts
+tests["physical_docx_styled_document"] = function()
+  local src_fixture = fixtures_dir .. "/styled-test.docx"
+  assert_true(vim.fn.filereadable(src_fixture) == 1, "styled-test.docx fixture exists")
+
+  local test_copy = test_dir .. "/test_styled.docx"
+  vim.fn.system(string.format("cp %s %s", vim.fn.shellescape(src_fixture), vim.fn.shellescape(test_copy)))
+
+  -- Open in Neovim
+  vim.cmd("edit " .. vim.fn.fnameescape(test_copy))
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  assert_equal(vim.bo[bufnr].filetype, "markdown", "filetype is markdown")
+  assert_equal(vim.bo[bufnr].buftype, "acwrite", "buftype is acwrite")
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  assert_true(table.concat(lines, "\n"):find("python%-docx was here") ~= nil, "Original content loaded")
+
+  -- Modify headings and text
+  table.insert(lines, "# New Heading 1 Level")
+  table.insert(lines, "## Subheading Level 2")
+  table.insert(lines, "Testing style preservation with Pandoc reference-doc.")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+
+  -- Save
+  vim.cmd("write")
+  assert_equal(vim.bo[bufnr].modified, false, "modified is false after saving")
+
+  -- Verify styles.xml is present and preserved
+  local unzip_styles = vim.fn.system("unzip -l " .. vim.fn.shellescape(test_copy))
+  assert_true(unzip_styles:find("word/styles%.xml") ~= nil, "styles.xml preserved in docx")
+
+  -- Verify pandoc can read the modified docx cleanly
+  local check_plain = vim.fn.system("pandoc " .. vim.fn.shellescape(test_copy) .. " -t plain")
+  assert_true(check_plain:find("New Heading 1 Level") ~= nil, "New heading in saved document")
+  assert_true(check_plain:find("Subheading Level 2") ~= nil, "Subheading in saved document")
+
+  vim.cmd("bdelete!")
+end
+
+-- Test 6: Physical Word document with tables
+tests["physical_docx_with_tables"] = function()
+  local src_fixture = fixtures_dir .. "/tables.docx"
+  assert_true(vim.fn.filereadable(src_fixture) == 1, "tables.docx fixture exists")
+
+  local test_copy = test_dir .. "/test_tables.docx"
+  vim.fn.system(string.format("cp %s %s", vim.fn.shellescape(src_fixture), vim.fn.shellescape(test_copy)))
+
+  vim.cmd("edit " .. vim.fn.fnameescape(test_copy))
+  local bufnr = vim.api.nvim_get_current_buf()
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  table.insert(lines, "Added paragraph between tables.")
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+
+  vim.cmd("write")
+  assert_equal(vim.bo[bufnr].modified, false, "saved tables docx")
+
+  local check_plain = vim.fn.system("pandoc " .. vim.fn.shellescape(test_copy) .. " -t plain")
+  assert_true(check_plain:find("Added paragraph between tables") ~= nil, "Table edits saved")
+
+  vim.cmd("bdelete!")
+end
+
+-- Test 7: Special characters in filename (spaces, ampersands, hashes)
 tests["filename_with_spaces_and_symbols"] = function()
   local tricky_name = test_dir .. "/Report - 2026 & Test (Special) #1.docx"
   vim.fn.system(string.format("cp %s/rich.docx %s", vim.fn.shellescape(test_dir), vim.fn.shellescape(tricky_name)))
@@ -178,7 +271,7 @@ tests["filename_with_spaces_and_symbols"] = function()
   vim.cmd("bdelete!")
 end
 
--- Test 6: Creating a brand new docx from scratch
+-- Test 8: Creating a brand new docx from scratch
 tests["create_new_docx_from_scratch"] = function()
   local new_docx = test_dir .. "/created_from_scratch.docx"
   vim.fn.delete(new_docx)
@@ -208,7 +301,7 @@ tests["create_new_docx_from_scratch"] = function()
   vim.cmd("bdelete!")
 end
 
--- Test 7: Save as new file (:w other_name.docx)
+-- Test 9: Save as new file (:w other_name.docx)
 tests["save_as_new_filename"] = function()
   local orig_docx = test_dir .. "/rich.docx"
   local copy_docx = test_dir .. "/copy_via_saveas.docx"
@@ -226,7 +319,7 @@ tests["save_as_new_filename"] = function()
   vim.cmd("bdelete!")
 end
 
--- Test 8: Workspace cleanup on buffer wipeout
+-- Test 10: Workspace cleanup on buffer wipeout
 tests["workspace_lifecycle_cleanup"] = function()
   local config = require("nvim-docx.config")
   config.setup({ auto_cleanup = true })
@@ -244,7 +337,7 @@ tests["workspace_lifecycle_cleanup"] = function()
   assert_equal(vim.fn.isdirectory(workspace), 0, "workspace deleted after bwipeout with auto_cleanup=true")
 end
 
--- Test 9: Corrupted docx file handling
+-- Test 11: Corrupted docx file handling
 tests["corrupted_docx_handling"] = function()
   local corrupt_docx = test_dir .. "/corrupted.docx"
   vim.fn.writefile({ "This is not a zip or docx file at all!" }, corrupt_docx)
@@ -253,11 +346,11 @@ tests["corrupted_docx_handling"] = function()
     vim.cmd("edit " .. vim.fn.fnameescape(corrupt_docx))
   end)
   assert_true(not ok, "Opening corrupted file correctly reports error")
-  assert_true(tostring(err):find("Pandoc") ~= nil, "Error mentions Pandoc: " .. tostring(err))
-  vim.cmd("bdelete!")
+  assert_true(tostring(err):find("[Pp]andoc") ~= nil, "Error mentions Pandoc: " .. tostring(err))
+  pcall(vim.cmd, "bdelete!")
 end
 
--- Test 10: Invalid pandoc binary path handling
+-- Test 12: Invalid pandoc binary path handling
 tests["invalid_pandoc_path_handling"] = function()
   local config = require("nvim-docx.config")
   config.setup({ pandoc_path = "/nonexistent/path/to/pandoc" })

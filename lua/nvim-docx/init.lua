@@ -19,15 +19,15 @@ local function absolute_path(path)
 end
 
 local function resolve_docx_path(ev, bufnr)
-  if ev and ev.file and ev.file ~= "" then
+  local name = vim.api.nvim_buf_get_name(bufnr)
+  if name ~= "" and utils.is_docx_file(name) then
+    return absolute_path(name)
+  end
+  if ev and ev.file and ev.file ~= "" and utils.is_docx_file(ev.file) then
     return absolute_path(ev.file)
   end
-  if ev and ev.match and ev.match ~= "" then
+  if ev and ev.match and ev.match ~= "" and utils.is_docx_file(ev.match) then
     return absolute_path(ev.match)
-  end
-  local name = vim.api.nvim_buf_get_name(bufnr)
-  if name ~= "" then
-    return absolute_path(name)
   end
   return absolute_path(vim.fn.expand("%:p"))
 end
@@ -121,14 +121,30 @@ function M.handle_docx_open(ev)
 end
 
 local function determine_target_path(ev, bufnr, state)
+  local buf_name = vim.api.nvim_buf_get_name(bufnr)
+  local canonical_name = (buf_name ~= "") and absolute_path(buf_name) or ""
+
+  -- Check if user issued an explicit "Save As" (:w different_name.docx)
+  if ev and ev.file and ev.file ~= "" then
+    local ev_abs = absolute_path(ev.file)
+    if ev_abs ~= canonical_name and utils.is_docx_file(ev_abs) and not ev.file:match("^[#%%]") then
+      return ev_abs
+    end
+  end
+
+  if canonical_name ~= "" and utils.is_docx_file(canonical_name) then
+    return canonical_name
+  end
+
+  if state and state.original_path and state.original_path ~= "" then
+    return state.original_path
+  end
+
   if ev and ev.file and ev.file ~= "" then
     return absolute_path(ev.file)
   end
-  local name = vim.api.nvim_buf_get_name(bufnr)
-  if name ~= "" then
-    return absolute_path(name)
-  end
-  return state.original_path
+
+  return ""
 end
 
 function M.handle_docx_save(ev)
