@@ -113,9 +113,13 @@ function M.docx_to_markdown(docx_path, md_path, workspace)
   local format = opts.markdown_format or "markdown"
   local bin = get_pandoc_bin()
 
+  -- Copy source docx into workspace as input.docx to prevent URI/path issues in pandoc across OS versions
+  local safe_in = workspace .. "/input.docx"
+  copy_file(docx_path, safe_in)
+
   local args = {
     bin,
-    docx_path,
+    safe_in,
     "-f", "docx",
     "-t", format,
     "-o", md_path,
@@ -131,6 +135,8 @@ function M.docx_to_markdown(docx_path, md_path, workspace)
   end
 
   local ok, output = execute_command(args, workspace)
+  vim.fn.delete(safe_in)
+
   if not ok then
     local err_msg = "Pandoc conversion failed: " .. (output ~= "" and output or "unknown error")
     utils.notify(err_msg, "error")
@@ -149,8 +155,10 @@ function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc)
   local format = opts.markdown_format or "markdown"
   local bin = get_pandoc_bin()
   local temp_out = workspace .. "/output_temp.docx"
+  local safe_ref = workspace .. "/reference.docx"
 
   vim.fn.delete(temp_out)
+  vim.fn.delete(safe_ref)
 
   local args = {
     bin,
@@ -161,11 +169,19 @@ function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc)
     "-o", temp_out,
   }
 
+  local has_ref = false
   if opts.preserve_styles and reference_doc and reference_doc ~= "" and vim.fn.filereadable(reference_doc) == 1 then
-    table.insert(args, string.format("--reference-doc=%s", reference_doc))
+    if copy_file(reference_doc, safe_ref) then
+      table.insert(args, string.format("--reference-doc=%s", safe_ref))
+      has_ref = true
+    end
   end
 
   local ok, output = execute_command(args, workspace)
+  if has_ref then
+    vim.fn.delete(safe_ref)
+  end
+
   if not ok then
     local err_msg = "Pandoc conversion to DOCX failed: " .. (output ~= "" and output or "unknown error")
     utils.notify(err_msg, "error")
