@@ -1,100 +1,126 @@
 # nvim-docx
 
-A Neovim plugin that enables transparent editing of Microsoft Word (.docx) files by converting them to Markdown for editing and back to .docx on save.
+[![Stargazers](https://img.shields.io/github/stars/DaanHessen/nvim-docx?style=flat-square)](https://github.com/DaanHessen/nvim-docx/stargazers)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](https://github.com/DaanHessen/nvim-docx/blob/main/LICENSE)
+[![Neovim](https://img.shields.io/badge/Neovim-0.8+-green.svg?style=flat-square)](https://neovim.io)
+
+Edit Microsoft Word (`.docx`) documents directly in Neovim as Markdown, converting seamlessly on open and save.
+
+Powered by [Pandoc](https://pandoc.org) and native Neovim autocommands (`BufReadCmd` / `BufWriteCmd`).
+
+---
 
 ## Features
 
-- 📝 Open .docx files directly in Neovim
-- 🔄 Automatic conversion to Markdown for editing
-- 💾 Save changes back to .docx format
-- 🧹 Automatic cleanup of temporary files
-- ⚡ Powered by Pandoc for reliable conversion
+* **Transparent editing**: Open any `.docx` file in Neovim (`nvim document.docx`) — it renders immediately as editable Markdown.
+* **Non-destructive saving**: Saving (`:w`) compiles Markdown back to `.docx` atomically, leaving the original file untouched until conversion succeeds.
+* **Style preservation**: Uses the original document as a Pandoc `--reference-doc`, preserving fonts, headings, and margins.
+* **Media handling**: Embedded figures and images are extracted to an isolated workspace cache and bundled back into the `.docx` archive upon save.
+* **Safe execution**: Runs via `vim.system` without spawning subshells or locking the editor UI.
+* **Diagnostics**: Built-in `:checkhealth nvim-docx` to verify environment dependencies.
+
+---
 
 ## Requirements
 
-- Neovim 0.7+
-- [Pandoc](https://pandoc.org/) installed and available in PATH
+* **Neovim** >= 0.8.0 (0.10+ recommended)
+* **[Pandoc](https://pandoc.org/)** available in your `PATH`
+
+---
 
 ## Installation
 
-### Using lazy.nvim
+### [lazy.nvim](https://github.com/folke/lazy.nvim)
 
 ```lua
 {
-  "daanh/nvim-docx",
+  "DaanHessen/nvim-docx",
+  ft = "docx",
+  opts = {
+    -- optional configuration
+  },
+}
+```
+
+### [pckr.nvim](https://github.com/lewis6991/pckr.nvim) / [packer.nvim](https://github.com/wbthomason/packer.nvim)
+
+```lua
+use {
+  "DaanHessen/nvim-docx",
   config = function()
-    require("nvim-docx").setup({
-      -- Optional configuration
-      debug = false,
-      auto_cleanup = true,
-    })
+    require("nvim-docx").setup()
   end,
 }
 ```
 
-### Using packer.nvim
-
-```lua
-use {
-  "daanh/nvim-docx",
-  config = function()
-    require("nvim-docx").setup()
-  end
-}
-```
-
-## Usage
-
-1. Simply open a `.docx` file in Neovim: `nvim document.docx`
-2. The plugin automatically converts it to Markdown for editing
-3. Edit the content as normal Markdown
-4. Save the file (`:w`) to convert back to .docx format
+---
 
 ## Configuration
 
+`nvim-docx` works out of the box with sensible defaults without calling `.setup()`. To customize options:
+
 ```lua
 require("nvim-docx").setup({
-  pandoc_path = "pandoc",                                    -- Path to pandoc executable
-  temp_dir = vim.fn.stdpath("cache") .. "/nvim-docx",       -- Temporary directory
-  auto_cleanup = true,                                       -- Auto-cleanup temp files
-  debug = false,                                             -- Enable debug logging
+  -- Path or command name for the pandoc binary
+  pandoc_path = "pandoc",
+
+  -- Base directory where isolated per-document workspaces are created
+  temp_dir = vim.fn.stdpath("cache") .. "/nvim-docx",
+
+  -- Markdown dialect used in Neovim ("markdown", "gfm", etc.)
+  markdown_format = "markdown",
+
+  -- Wipe workspace cache and temporary media when the buffer is closed
+  auto_cleanup = true,
+
+  -- Retain original Word formatting and typography via Pandoc reference-doc
+  preserve_styles = true,
+
+  -- Markdown line wrap mode ("none", "auto", "preserve")
+  wrap = "none",
+
+  -- Track-changes policy ("accept", "reject", "all", or nil to use pandoc default)
+  track_changes = nil,
+
+  -- Output verbose debugging notifications
+  debug = false,
 })
 ```
 
-## How it Works
+---
 
-1. When you open a `.docx` file, the plugin intercepts the `BufReadPre` event
-2. Pandoc converts the `.docx` file to Markdown format
-3. The Markdown content is loaded into the Neovim buffer
-4. You edit the content as normal Markdown
-5. On save (`BufWritePost`), the plugin converts the Markdown back to `.docx`
-6. The original `.docx` file is updated with your changes
+## How It Works
+
+1. **Interception**: When a `.docx` buffer opens, a `BufReadCmd` autocommand intercepts the event before Neovim reads the binary ZIP container.
+2. **Workspace**: An isolated temporary directory is created inside `temp_dir` (`~/.cache/nvim/nvim-docx/<name>-<id>/`).
+3. **Extraction**: Pandoc converts the document into Markdown and extracts any embedded images into the workspace.
+4. **Virtual buffer**: Buffer content is populated with Markdown text, and `buftype` is set to `acwrite`.
+5. **Atomic write**: On `:w`, a `BufWriteCmd` autocommand serializes the buffer and invokes Pandoc to build a temporary `.docx` using the original file as `--reference-doc`. Once successful, it atomically replaces the target file.
+6. **Cleanup**: When `auto_cleanup = true`, closing or wiping the buffer (`BufWipeout`) removes the temporary workspace.
+
+---
+
+## Health Check
+
+Run `:checkhealth nvim-docx` in Neovim to verify your setup:
+
+```
+nvim-docx: require("nvim-docx.health").check()
+
+- OK Neovim version: 0.12.5
+- OK Pandoc executable found at 'pandoc' (3.10.2)
+- OK Workspace cache directory writable: /home/user/.cache/nvim/nvim-docx
+```
+
+---
 
 ## Limitations
 
-- Complex Word formatting may not be perfectly preserved
-- Images and media are extracted to the temp directory
-- Some Word-specific features (comments, track changes) are not supported
-- Conversion quality depends on Pandoc's capabilities
+* Complex proprietary Word structures (such as SmartArt, embedded macros, or ActiveX controls) cannot be represented in Markdown and will be omitted by Pandoc.
+* Conversion fidelity depends on Pandoc's OOXML and Markdown capabilities.
 
-## Troubleshooting
-
-### Pandoc not found
-Make sure Pandoc is installed and available in your PATH:
-```bash
-# Check if pandoc is available
-pandoc --version
-
-# Install on Arch Linux
-sudo pacman -S pandoc
-
-# Install on Ubuntu/Debian
-sudo apt install pandoc
-
-# Install on macOS
-brew install pandoc
-```
+---
 
 ## License
 
-MIT License
+Distributed under the [MIT License](LICENSE).
