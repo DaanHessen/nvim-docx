@@ -626,6 +626,68 @@ add_test("no_workspace_leaks_on_reload_or_bdelete", function()
   assert_equal(vim.fn.isdirectory(ws2), 0, "Workspace cleaned up on :bdelete!")
 end)
 
+-- Test 20: Real-world OOXML quirks (numId=0 suppression, startOverride restart, verbatim sup/sub, VML & external images)
+add_test("real_world_ooxml_quirks_roundtrip", function()
+  -- 1. Verbatim inside superscript/subscript (`m`^`2`^ and `m`~`2`~)
+  local v_ast = markdown.markdown_to_ast({ "`m`^`2`^ and `m`~`2`~" })
+  local v_md = markdown.ast_to_markdown(v_ast)
+  assert_equal(v_md, "`m`^`2`^ and `m`~`2`~", "Verbatim superscript/subscript idempotency")
+
+  -- 2. numId=0 list suppression, startOverride list restart, VML image dimensions, and external image roundtrip
+  local arch = ooxml.ast_to_docx(markdown.markdown_to_ast({ "Init" }), test_dir, nil, {})
+  arch.files["word/numbering.xml"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+    '<w:abstractNum w:abstractNumId="0">',
+      '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:pStyle w:val="ListNumber"/></w:lvl>',
+    '</w:abstractNum>',
+    '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>',
+    '<w:num w:numId="2"><w:abstractNumId w:val="0"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>',
+    '</w:numbering>',
+  })
+  arch.files["word/styles.xml"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+    '<w:style w:type="paragraph" w:styleId="ListNumber">',
+      '<w:name w:val="List Number"/>',
+      '<w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr>',
+    '</w:style>',
+    '</w:styles>',
+  })
+  arch.files["word/_rels/document.xml.rels"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId10" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="external-pic.png" TargetMode="External"/>',
+    '</Relationships>',
+  })
+  arch.files["word/document.xml"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ',
+    'xmlns:v="urn:schemas-microsoft-com:vml">',
+    '<w:body>',
+      '<w:p><w:pPr><w:pStyle w:val="ListNumber"/></w:pPr><w:r><w:t>First</w:t></w:r></w:p>',
+      '<w:p><w:pPr><w:pStyle w:val="ListNumber"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="0"/></w:numPr></w:pPr><w:r><w:t>Suppressed list item   </w:t></w:r></w:p>',
+      '<w:p><w:r><w:tab/></w:r></w:p>',
+      '<w:p><w:pPr><w:pStyle w:val="ListNumber"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t>Restarted 1</w:t></w:r></w:p>',
+      '<w:p><w:pPr><w:pStyle w:val="ListNumber"/></w:pPr><w:r><w:t>Continued 2</w:t></w:r></w:p>',
+      '<w:p><w:r><w:pict><v:rect style="width:72pt;height:36pt"><v:imagedata r:id="rId10"/></v:rect></w:pict></w:r></w:p>',
+    '</w:body></w:document>',
+  })
+
+  local ast1 = ooxml.docx_to_ast(arch, test_dir, {})
+  local md1 = markdown.ast_to_markdown(ast1)
+  assert_true(md1:find("1%. First\n\nSuppressed list item\n\n1%. Restarted 1\n2%. Continued 2") ~= nil, "numId=0 suppression, tab-only paragraph removal, and startOverride restart: " .. md1)
+  assert_true(md1:find('!%[%]%(external%-pic%.png%){width="1in" height="0%.5in"}') ~= nil, "VML style dimensions and external image extracted: " .. md1)
+
+  -- Round-trip back to DOCX and verify external image + dimensions survive
+  local ast2 = markdown.markdown_to_ast(vim.split(md1, "\n", { plain = true }))
+  local arch2 = ooxml.ast_to_docx(ast2, test_dir, arch, { preserve_styles = true })
+  local ast3 = ooxml.docx_to_ast(arch2, test_dir, {})
+  local md3 = markdown.ast_to_markdown(ast3)
+  assert_equal(md3, md1, "Full round-trip preserves external image dimensions and list numbering")
+end)
+
 -- Main runner
 local ok_setup, setup_err = pcall(setup_env)
 if not ok_setup then

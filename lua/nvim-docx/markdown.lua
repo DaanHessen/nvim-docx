@@ -475,15 +475,44 @@ local function format_text_span(node)
     return ""
   end
 
+  local has_style = node.bold or node.italic or node.strike or node.sup or node.sub
+
   if node.code then
+    local code_span
     if txt:find("`", 1, true) then
       local pad = (txt:sub(1, 1) == "`" or txt:sub(-1) == "`") and " " or ""
-      return "``" .. pad .. txt .. pad .. "``"
+      code_span = "``" .. pad .. txt .. pad .. "``"
+    else
+      code_span = "`" .. txt .. "`"
     end
-    return "`" .. txt .. "`"
+    if not has_style then
+      return code_span
+    end
+    local open_m, close_m = "", ""
+    if node.bold and node.italic then
+      open_m = open_m .. "***"
+      close_m = "***" .. close_m
+    elseif node.bold then
+      open_m = open_m .. "**"
+      close_m = "**" .. close_m
+    elseif node.italic then
+      open_m = open_m .. "*"
+      close_m = "*" .. close_m
+    end
+    if node.strike then
+      open_m = open_m .. "~~"
+      close_m = "~~" .. close_m
+    end
+    if node.sup then
+      open_m = open_m .. "^"
+      close_m = "^" .. close_m
+    elseif node.sub then
+      open_m = open_m .. "~"
+      close_m = "~" .. close_m
+    end
+    return open_m .. code_span .. close_m
   end
 
-  local has_style = node.bold or node.italic or node.strike or node.sup or node.sub
   if not has_style then
     return txt
   end
@@ -940,27 +969,57 @@ function M.markdown_to_ast(lines, opts)
         checked = (box:lower() == "x")
         item_text = after_box
       end
+      local item_parts = { item_text }
+      idx = idx + 1
+      while item_parts[#item_parts]:match("\\%s*$") and idx <= n and not lines[idx]:match("^%s*$") do
+        item_parts[#item_parts] = item_parts[#item_parts]:gsub("\\%s*$", "")
+        item_parts[#item_parts + 1] = lines[idx]
+        idx = idx + 1
+      end
+      local item_inlines = {}
+      for pi, part in ipairs(item_parts) do
+        for _, inl in ipairs(M.parse_inlines(part)) do
+          item_inlines[#item_inlines + 1] = inl
+        end
+        if pi < #item_parts then
+          item_inlines[#item_inlines + 1] = { type = "linebreak" }
+        end
+      end
       doc.blocks[#doc.blocks + 1] = {
         type = "list_item",
         ordered = false,
         level = level,
         checked = checked,
-        inlines = M.parse_inlines(item_text),
+        inlines = M.merge_inlines(item_inlines),
       }
-      idx = idx + 1
 
     -- Ordered list item (1. or 1))
     elseif line:match("^(%s*)(%d+)[%.%)]%s+(.*)$") then
       local indent, num_str, item_text = line:match("^(%s*)(%d+)[%.%)]%s+(.*)$")
       local level = resolve_indent_level(indent)
+      local item_parts = { item_text }
+      idx = idx + 1
+      while item_parts[#item_parts]:match("\\%s*$") and idx <= n and not lines[idx]:match("^%s*$") do
+        item_parts[#item_parts] = item_parts[#item_parts]:gsub("\\%s*$", "")
+        item_parts[#item_parts + 1] = lines[idx]
+        idx = idx + 1
+      end
+      local item_inlines = {}
+      for pi, part in ipairs(item_parts) do
+        for _, inl in ipairs(M.parse_inlines(part)) do
+          item_inlines[#item_inlines + 1] = inl
+        end
+        if pi < #item_parts then
+          item_inlines[#item_inlines + 1] = { type = "linebreak" }
+        end
+      end
       doc.blocks[#doc.blocks + 1] = {
         type = "list_item",
         ordered = true,
         level = level,
         number = tonumber(num_str) or 1,
-        inlines = M.parse_inlines(item_text),
+        inlines = M.merge_inlines(item_inlines),
       }
-      idx = idx + 1
 
     -- Setext Heading (Paragraph line followed by === or ---)
     elseif idx < n and not line:match("^%s*$") and (lines[idx + 1]:match("^%s*===+%s*$") or lines[idx + 1]:match("^%s*%-%-%-+%s*$")) then

@@ -334,6 +334,9 @@ function M.matches(node, tag_or_local)
   if not node or not node.tag then
     return false
   end
+  if not tag_or_local then
+    return true
+  end
   return node.tag == tag_or_local or node.local_name == tag_or_local
 end
 

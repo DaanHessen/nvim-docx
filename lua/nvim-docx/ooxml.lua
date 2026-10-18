@@ -411,6 +411,10 @@ local function parse_numbering(archive)
 end
 
 local function resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
+  -- Explicit <w:numId w:val="0"/> on the paragraph suppresses inherited list numbering
+  if num_id and tostring(num_id) == "0" then
+    return false, false, 0, 1, nil, false
+  end
   if not num_id and pstyle and styles[pstyle] then
     num_id = styles[pstyle].num_id
     if not ilvl then
@@ -422,19 +426,22 @@ local function resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
     if pstyle then
       local sl = pstyle:lower()
       if sl:find("listbullet") or sl == "listparagraph" then
-        return true, false, ilvl or 0, 1
+        return true, false, ilvl or 0, 1, "style:" .. sl, false
       elseif sl:find("listnumber") then
-        return true, true, ilvl or 0, 1
+        return true, true, ilvl or 0, 1, "style:" .. sl, false
       end
     end
-    return false, false, 0, 1
+    return false, false, 0, 1, nil, false
   end
 
   ilvl = tonumber(ilvl) or 0
   local ninfo = numbering.nums[tostring(num_id)]
   local num_fmt = "bullet"
   local start_val = 1
+  local abs_key = "num:" .. tostring(num_id)
+  local has_start_override = false
   if ninfo then
+    abs_key = "abs:" .. tostring(ninfo.abstract_id)
     local abs = numbering.abstract[ninfo.abstract_id]
     if abs and abs[ilvl] then
       num_fmt = abs[ilvl].num_fmt or "bullet"
@@ -443,12 +450,15 @@ local function resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
     local ov = ninfo.overrides and ninfo.overrides[ilvl]
     if ov then
       if ov.num_fmt then num_fmt = ov.num_fmt end
-      if ov.start then start_val = ov.start end
+      if ov.start then
+        start_val = ov.start
+        has_start_override = true
+      end
     end
   end
 
   local ordered = (num_fmt ~= "bullet" and num_fmt ~= "none")
-  return true, ordered, ilvl, start_val
+  return true, ordered, ilvl, start_val, abs_key, has_start_override
 end
 
 function M.docx_to_ast(archive, workspace, opts)
@@ -654,6 +664,20 @@ function M.docx_to_ast(archive, workspace, opts)
       local cy = xml.get_attr(extent, "cy")
       width_str = image.emu_to_inches_str(cx)
       height_str = image.emu_to_inches_str(cy)
+    else
+      -- Check VML shape style="...width:126.25pt;height:187.35pt..."
+      for _, el in ipairs(xml.find_all(drawing_node)) do
+        local st = xml.get_attr(el, "style")
+        if st then
+          local w_val = st:match("width%s*:%s*([^;%s]+)")
+          local h_val = st:match("height%s*:%s*([^;%s]+)")
+          if w_val or h_val then
+            if w_val then width_str = image.emu_to_inches_str(image.parse_length_to_emu(w_val)) end
+            if h_val then height_str = image.emu_to_inches_str(image.parse_length_to_emu(h_val)) end
+            break
+          end
+        end
+      end
     end
 
     return {
@@ -1006,6 +1030,43 @@ function M.docx_to_ast(archive, workspace, opts)
     return markdown.merge_inlines(inlines), found_hr, found_checkbox, only_omath_para
   end
 
+  local function trim_inlines(inlines, trim_leading_spaces)
+    if not inlines then
+      return {}
+    end
+    while #inlines > 0 do
+      local first = inlines[1]
+      if first.type == "tab" then
+        table.remove(inlines, 1)
+      elseif trim_leading_spaces and first.type == "text" then
+        first.text = (first.text or ""):gsub("^[ \t]+", "")
+        if first.text == "" then
+          table.remove(inlines, 1)
+        else
+          break
+        end
+      else
+        break
+      end
+    end
+    while #inlines > 0 do
+      local last = inlines[#inlines]
+      if last.type == "tab" then
+        table.remove(inlines, #inlines)
+      elseif last.type == "text" then
+        last.text = (last.text or ""):gsub("[ \t]+$", "")
+        if last.text == "" then
+          table.remove(inlines, #inlines)
+        else
+          break
+        end
+      else
+        break
+      end
+    end
+    return inlines
+  end
+
   local function parse_notes_file(path, target_table, tag_name, note_rels)
     local raw = archive.files[path]
     if not raw then return end
@@ -1017,15 +1078,9 @@ function M.docx_to_ast(archive, workspace, opts)
       local is_valid_id = fid and tonumber(fid) ~= nil and (tag_name == "comment" and tonumber(fid) >= 0 or tonumber(fid) > 0)
       if is_valid_id and ftype ~= "separator" and ftype ~= "continuationSeparator" then
         local note_inlines = {}
-        if tag_name == "comment" then
-          local author = xml.get_attr(fnode, "w:author")
-          if author and author ~= "" then
-            note_inlines[#note_inlines + 1] = { type = "text", text = "[" .. author .. "]: ", bold = true }
-          end
-        end
         local paras = xml.find_children(fnode, "p")
         for pi, p in ipairs(paras) do
-          local pinl = extract_inlines_from_nodes(p.children, false, nil, note_rels)
+          local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false, nil, note_rels), true)
           for _, item in ipairs(pinl) do
             note_inlines[#note_inlines + 1] = item
           end
@@ -1033,11 +1088,12 @@ function M.docx_to_ast(archive, workspace, opts)
             note_inlines[#note_inlines + 1] = { type = "text", text = " " }
           end
         end
-        local merged_notes = markdown.merge_inlines(note_inlines)
-        if merged_notes[1] and merged_notes[1].type == "text" and not merged_notes[1].bold then
-          merged_notes[1].text = merged_notes[1].text:gsub("^%s+", "")
-          if merged_notes[1].text == "" then
-            table.remove(merged_notes, 1)
+        local merged_notes = trim_inlines(markdown.merge_inlines(note_inlines), true)
+        if tag_name == "comment" then
+          local author = xml.get_attr(fnode, "w:author")
+          if author and author ~= "" then
+            table.insert(merged_notes, 1, { type = "text", text = "[" .. author .. "]: ", bold = true })
+            merged_notes = markdown.merge_inlines(merged_notes)
           end
         end
         target_table[tostring(fid)] = merged_notes
@@ -1050,6 +1106,7 @@ function M.docx_to_ast(archive, workspace, opts)
   parse_notes_file("word/endnotes.xml", raw_endnotes, "endnote", endnote_rels)
 
   local ordered_counters = {}
+  local seen_override_nums = {}
 
   local function process_paragraph(pnode)
     local ppr = xml.find_child(pnode, "pPr")
@@ -1108,6 +1165,8 @@ function M.docx_to_ast(archive, workspace, opts)
       return
     end
 
+    inlines = trim_inlines(inlines, false)
+
     if found_hr or (has_bottom_border and #inlines == 0) then
       ast.blocks[#ast.blocks + 1] = { type = "hr" }
       if #inlines == 0 then
@@ -1134,16 +1193,19 @@ function M.docx_to_ast(archive, workspace, opts)
 
     if h_lvl then
       ordered_counters = {}
+      seen_override_nums = {}
       ast.blocks[#ast.blocks + 1] = {
         type = "heading",
         level = h_lvl,
-        inlines = inlines,
+        inlines = trim_inlines(inlines, true),
       }
       return
     end
 
-    local is_list, is_ordered, list_lvl, start_val = resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
+    local is_list, is_ordered, list_lvl, start_val, abs_key, has_start_override =
+      resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
     if is_list then
+      inlines = trim_inlines(inlines, true)
       -- Check leading Unicode checkbox characters ☐ (E2 98 90), ☑ (E2 98 91), ☒ (E2 98 92)
       local first_inl = inlines[1]
       if first_inl and first_inl.type == "text" then
@@ -1160,7 +1222,7 @@ function M.docx_to_ast(archive, workspace, opts)
       end
 
       -- Clear counters for any deeper nesting levels so sublists restart at 1
-      local list_prefix = tostring(num_id or pstyle or "default") .. ":"
+      local list_prefix = tostring(abs_key or num_id or pstyle or "default") .. ":"
       for k, _ in pairs(ordered_counters) do
         local klvl = tonumber(k:match(":(%d+)$"))
         if klvl and klvl > list_lvl then
@@ -1169,9 +1231,13 @@ function M.docx_to_ast(archive, workspace, opts)
       end
 
       local counter_key = list_prefix .. tostring(list_lvl)
+      local override_key = tostring(num_id or "") .. ":" .. tostring(list_lvl)
       local item_num = nil
       if is_ordered then
-        if not ordered_counters[counter_key] then
+        if has_start_override and not seen_override_nums[override_key] then
+          seen_override_nums[override_key] = true
+          ordered_counters[counter_key] = start_val or 1
+        elseif not ordered_counters[counter_key] then
           ordered_counters[counter_key] = start_val or 1
         else
           ordered_counters[counter_key] = ordered_counters[counter_key] + 1
@@ -1191,6 +1257,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
 
     ordered_counters = {}
+    seen_override_nums = {}
 
     if is_blockquote_para_style(styles, pstyle) then
       ast.blocks[#ast.blocks + 1] = {
@@ -1209,6 +1276,7 @@ function M.docx_to_ast(archive, workspace, opts)
 
   local function process_table(tbl_node)
     ordered_counters = {}
+    seen_override_nums = {}
     local all_rows = {}
     local alignments = {}
 
@@ -1763,7 +1831,9 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
     end
 
     if not img_bytes then
-      return nil, nil, nil
+      local rid = add_rel(REL_IMAGE, src, "External")
+      local cx, cy = image.resolve_dimensions_emu(nil, img_node.width, img_node.height)
+      return rid, cx, cy
     end
 
     local base_name = vim.fn.fnamemodify(src, ":t")
