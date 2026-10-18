@@ -32,8 +32,28 @@ local function resolve_docx_path(ev, bufnr)
   return absolute_path(vim.fn.expand("%:p"))
 end
 
+local active_workspaces = {}
+
+local function cleanup_state_files(state)
+  if not state then
+    return
+  end
+  if state.last_temp_file then
+    utils.cleanup_temp_file(state.last_temp_file)
+    state.last_temp_file = nil
+  end
+  if state.workspace then
+    active_workspaces[state.workspace] = nil
+    utils.cleanup_workspace(state.workspace)
+    state.workspace = nil
+  end
+end
+
 local function set_buffer_state(bufnr, state)
   if state then
+    if state.workspace then
+      active_workspaces[state.workspace] = state
+    end
     vim.b[bufnr].nvim_docx_state = state
     vim.b[bufnr].nvim_docx_active = true
     vim.b[bufnr].nvim_docx_original_path = state.original_path
@@ -60,10 +80,20 @@ end
 
 function M.handle_docx_open(ev)
   local bufnr = get_bufnr(ev)
+  local prev_state = get_buffer_state(bufnr)
   local docx_path = resolve_docx_path(ev, bufnr)
+
+  if (docx_path == "" or not utils.is_docx_file(docx_path)) and prev_state and prev_state.original_path then
+    docx_path = prev_state.original_path
+  end
 
   if docx_path == "" or not utils.is_docx_file(docx_path) then
     return
+  end
+
+  -- Clean up any previous workspace attached to this buffer (e.g., on :edit!)
+  if prev_state and config.options.auto_cleanup then
+    cleanup_state_files(prev_state)
   end
 
   local file_exists = (vim.fn.filereadable(docx_path) == 1)
@@ -77,7 +107,7 @@ function M.handle_docx_open(ev)
         utils.cleanup_temp_file(temp_md)
         utils.cleanup_workspace(workspace)
       end
-      return
+      error(conv_err or "Failed to open DOCX")
     end
 
     local content, err = utils.read_file_lines(temp_md)
@@ -123,21 +153,22 @@ end
 local function determine_target_path(ev, bufnr, state)
   local buf_name = vim.api.nvim_buf_get_name(bufnr)
   local canonical_name = (buf_name ~= "") and absolute_path(buf_name) or ""
+  local orig_path = (state and state.original_path) or ""
 
   -- Check if user issued an explicit "Save As" (:w different_name.docx)
-  if ev and ev.file and ev.file ~= "" then
+  if ev and ev.file and ev.file ~= "" and ev.file ~= buf_name then
     local ev_abs = absolute_path(ev.file)
-    if ev_abs ~= canonical_name and utils.is_docx_file(ev_abs) and not ev.file:match("^[#%%]") then
+    if ev_abs ~= canonical_name and ev_abs ~= orig_path and utils.is_docx_file(ev_abs) and not ev.file:match("^[#%%]") then
       return ev_abs
     end
   end
 
-  if canonical_name ~= "" and utils.is_docx_file(canonical_name) then
-    return canonical_name
+  if orig_path ~= "" and utils.is_docx_file(orig_path) then
+    return orig_path
   end
 
-  if state and state.original_path and state.original_path ~= "" then
-    return state.original_path
+  if canonical_name ~= "" and utils.is_docx_file(canonical_name) then
+    return canonical_name
   end
 
   if ev and ev.file and ev.file ~= "" then
@@ -153,6 +184,11 @@ function M.handle_docx_save(ev)
 
   if not state or not state.original_path then
     return
+  end
+
+  if not state.workspace or vim.fn.isdirectory(state.workspace) == 0 then
+    state.workspace = utils.create_workspace(state.original_path)
+    active_workspaces[state.workspace] = state
   end
 
   local target_path = determine_target_path(ev, bufnr, state)
@@ -174,7 +210,7 @@ function M.handle_docx_save(ev)
     ref_doc = nil
   end
 
-  local save_ok, save_err = converter.markdown_to_docx(temp_md, target_path, state.workspace, ref_doc)
+  local save_ok = converter.markdown_to_docx(temp_md, target_path, state.workspace, ref_doc)
   if not save_ok then
     if config.options.auto_cleanup then
       utils.cleanup_temp_file(temp_md)
@@ -204,15 +240,137 @@ function M.handle_docx_close(ev)
   end
 
   if config.options.auto_cleanup then
-    if state.last_temp_file then
-      utils.cleanup_temp_file(state.last_temp_file)
-    end
-    if state.workspace then
-      utils.cleanup_workspace(state.workspace)
-    end
+    cleanup_state_files(state)
   end
 
   set_buffer_state(bufnr, nil)
+end
+
+function M.cleanup_all_workspaces()
+  if not config.options.auto_cleanup then
+    return
+  end
+  for ws, state in pairs(active_workspaces) do
+    if state and state.last_temp_file then
+      utils.cleanup_temp_file(state.last_temp_file)
+    end
+    utils.cleanup_workspace(ws)
+    active_workspaces[ws] = nil
+  end
+end
+
+function M.docx_info(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local state = get_buffer_state(bufnr)
+  local docx_path = state and state.original_path or resolve_docx_path(nil, bufnr)
+
+  if not docx_path or docx_path == "" or vim.fn.filereadable(docx_path) ~= 1 then
+    utils.notify("Current buffer is not backed by an existing .docx file on disk", "warn")
+    return nil
+  end
+
+  local stats, err = converter.get_docx_info(docx_path)
+  if not stats then
+    utils.notify("Failed to read DOCX info: " .. tostring(err), "error")
+    return nil
+  end
+
+  local summary = {
+    string.format("File: %s", vim.fn.fnamemodify(docx_path, ":t")),
+    string.format("Words: %d | Characters: %d", stats.words, stats.chars),
+    string.format(
+      "Blocks: %d headings, %d paragraphs, %d list items, %d tables, %d images",
+      stats.headings,
+      stats.paragraphs,
+      stats.list_items,
+      stats.tables,
+      stats.images
+    ),
+  }
+  if stats.metadata and (stats.metadata.title or stats.metadata.author) then
+    summary[#summary + 1] = string.format(
+      "Metadata: title=%s, author=%s",
+      tostring(stats.metadata.title or "-"),
+      tostring(stats.metadata.author or "-")
+    )
+  end
+
+  utils.notify(table.concat(summary, "\n"), "info")
+  return stats
+end
+
+function M.export_markdown(target_md_path, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local state = get_buffer_state(bufnr)
+  local base_docx = (state and state.original_path) or vim.api.nvim_buf_get_name(bufnr)
+
+  if not target_md_path or target_md_path == "" then
+    if base_docx == "" then
+      utils.notify("Please specify a target Markdown path", "error")
+      return false
+    end
+    target_md_path = vim.fn.fnamemodify(base_docx, ":p:r") .. ".md"
+  else
+    target_md_path = absolute_path(target_md_path)
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local ok, err = utils.write_file_lines(target_md_path, lines)
+  if not ok then
+    utils.notify("Failed to export Markdown: " .. tostring(err), "error")
+    return false
+  end
+
+  -- Copy extracted media directory next to target_md_path if present
+  if state and state.workspace and vim.fn.isdirectory(state.workspace .. "/media") == 1 then
+    local dst_media = vim.fn.fnamemodify(target_md_path, ":p:h") .. "/media"
+    utils.ensure_dir(dst_media)
+    local files = vim.fn.glob(state.workspace .. "/media/*", false, true)
+    local uv = vim.uv or vim.loop
+    for _, src_f in ipairs(files) do
+      local dst_f = dst_media .. "/" .. vim.fn.fnamemodify(src_f, ":t")
+      if uv and uv.fs_copyfile then
+        uv.fs_copyfile(src_f, dst_f)
+      end
+    end
+  end
+
+  utils.notify("Exported Markdown to: " .. target_md_path, "info")
+  return true, target_md_path
+end
+
+function M.from_markdown(target_docx_path, bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  local cur_name = vim.api.nvim_buf_get_name(bufnr)
+
+  if not target_docx_path or target_docx_path == "" then
+    if cur_name == "" then
+      utils.notify("Please specify an output .docx path", "error")
+      return false
+    end
+    target_docx_path = vim.fn.fnamemodify(cur_name, ":p:r") .. ".docx"
+  else
+    target_docx_path = absolute_path(target_docx_path)
+    if not utils.is_docx_file(target_docx_path) then
+      target_docx_path = target_docx_path .. ".docx"
+    end
+  end
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local source_dir = cur_name ~= "" and vim.fn.fnamemodify(cur_name, ":p:h") or vim.fn.getcwd()
+  local ws = utils.create_workspace(target_docx_path)
+
+  local ok, err = converter.markdown_lines_to_docx(lines, target_docx_path, ws, nil, {
+    source_dir = source_dir,
+  })
+  utils.cleanup_workspace(ws)
+
+  if not ok then
+    return false, err
+  end
+
+  utils.notify("Compiled Markdown to DOCX: " .. target_docx_path, "info")
+  return true, target_docx_path
 end
 
 return M
