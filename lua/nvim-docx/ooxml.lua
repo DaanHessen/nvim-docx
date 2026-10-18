@@ -1301,7 +1301,7 @@ function M.docx_to_ast(archive, workspace, opts)
                     end
                   end
                 end
-                local pinl = extract_inlines_from_nodes(p.children, false)
+                local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false), true)
                 if #pinl > 0 then
                   if #cell_inlines > 0 then
                     cell_inlines[#cell_inlines + 1] = { type = "linebreak" }
@@ -1311,7 +1311,7 @@ function M.docx_to_ast(archive, workspace, opts)
                   end
                 end
               end
-              row_cells[#row_cells + 1] = markdown.merge_inlines(cell_inlines)
+              row_cells[#row_cells + 1] = trim_inlines(markdown.merge_inlines(cell_inlines), true)
 
               -- Handle horizontal span <w:gridSpan w:val="N"/>
               local tc_pr = xml.find_child(tc, "tcPr")
@@ -1707,6 +1707,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   local header_footer_media = {}
 
   if preserve and reference_archive and reference_archive.files then
+    archive.raw_entries = reference_archive.raw_entries
     for k, v in pairs(reference_archive.files) do
       -- Copy all files except body-specific media that we will re-populate or retain
       if not k:match("^word/media/") then

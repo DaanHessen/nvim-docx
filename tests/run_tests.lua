@@ -672,6 +672,10 @@ add_test("real_world_ooxml_quirks_roundtrip", function()
       '<w:p><w:pPr><w:pStyle w:val="ListNumber"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="2"/></w:numPr></w:pPr><w:r><w:t>Restarted 1</w:t></w:r></w:p>',
       '<w:p><w:pPr><w:pStyle w:val="ListNumber"/></w:pPr><w:r><w:t>Continued 2</w:t></w:r></w:p>',
       '<w:p><w:r><w:pict><v:rect style="width:72pt;height:36pt"><v:imagedata r:id="rId10"/></v:rect></w:pict></w:r></w:p>',
+      '<w:tbl>',
+        '<w:tr><w:tc><w:p><w:r><w:t> H1 </w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t> H2 </w:t></w:r></w:p></w:tc></w:tr>',
+        '<w:tr><w:tc><w:p><w:r><w:t>Aliquam erat volutpat.  </w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>  Lorem  </w:t></w:r></w:p></w:tc></w:tr>',
+      '</w:tbl>',
     '</w:body></w:document>',
   })
 
@@ -679,13 +683,20 @@ add_test("real_world_ooxml_quirks_roundtrip", function()
   local md1 = markdown.ast_to_markdown(ast1)
   assert_true(md1:find("1%. First\n\nSuppressed list item\n\n1%. Restarted 1\n2%. Continued 2") ~= nil, "numId=0 suppression, tab-only paragraph removal, and startOverride restart: " .. md1)
   assert_true(md1:find('!%[%]%(external%-pic%.png%){width="1in" height="0%.5in"}') ~= nil, "VML style dimensions and external image extracted: " .. md1)
+  assert_true(md1:find("| Aliquam erat volutpat%. | Lorem |") ~= nil, "Table cell leading/trailing spaces trimmed for idempotency: " .. md1)
 
-  -- Round-trip back to DOCX and verify external image + dimensions survive
+  -- Round-trip back to DOCX and verify external image + dimensions + table cells survive
   local ast2 = markdown.markdown_to_ast(vim.split(md1, "\n", { plain = true }))
   local arch2 = ooxml.ast_to_docx(ast2, test_dir, arch, { preserve_styles = true })
   local ast3 = ooxml.docx_to_ast(arch2, test_dir, {})
   local md3 = markdown.ast_to_markdown(ast3)
-  assert_equal(md3, md1, "Full round-trip preserves external image dimensions and list numbering")
+  assert_equal(md3, md1, "Full round-trip preserves external image dimensions, list numbering, and trimmed table cells")
+
+  -- Legacy binary .doc (OLE2 Compound Document) detection
+  local ole2_bytes = "\208\207\017\224\161\177\026\225" .. string.rep("\0", 32)
+  local ole_arch, ole_err = zip.read_zip_bytes(ole2_bytes)
+  assert_true(ole_arch == nil, "OLE2 binary .doc rejected")
+  assert_true((ole_err or ""):find("OLE2") ~= nil, "OLE2 error mentions legacy .doc format: " .. tostring(ole_err))
 end)
 
 -- Main runner

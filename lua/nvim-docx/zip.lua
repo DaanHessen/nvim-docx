@@ -589,6 +589,9 @@ function M.read_zip_bytes(bytes)
 
   -- Check local file signature at start (or empty zip EOCD)
   local first_sig = read_u32(bytes, 1)
+  if first_sig == 0xE011CFD0 then
+    return nil, "Not a valid ZIP/DOCX archive: legacy binary .doc (OLE2) format is not supported"
+  end
   if first_sig ~= SIG_LOCAL_FILE and first_sig ~= SIG_EOCD then
     return nil, "Not a valid ZIP/DOCX archive (invalid magic bytes)"
   end
@@ -623,6 +626,7 @@ function M.read_zip_bytes(bytes)
   end
 
   local entries = {}
+  local raw_entries = {}
   local files = {}
   local order = {}
   local pos = cd_offset + 1
@@ -735,15 +739,18 @@ function M.read_zip_bytes(bytes)
 
       files[name] = content
       order[#order + 1] = name
-      entries[#entries + 1] = {
+      local entry_info = {
         name = name,
         data = content,
+        raw_data = raw_data,
         method = method,
         flags = flags,
         dos_time = dos_time,
         dos_date = dos_date,
         crc = crc,
       }
+      entries[#entries + 1] = entry_info
+      raw_entries[name] = entry_info
     end
   end
 
@@ -751,6 +758,7 @@ function M.read_zip_bytes(bytes)
     files = files,
     order = order,
     entries = entries,
+    raw_entries = raw_entries,
   }
 end
 
@@ -769,16 +777,33 @@ local function is_precompressed_media(name, size)
     return false
   end
   local lower = name:lower()
-  return lower:match("%.png$") ~= nil
-    or lower:match("%.jpe?g$") ~= nil
-    or lower:match("%.gif$") ~= nil
-    or lower:match("%.webp$") ~= nil
+  if lower:match("%.png$")
+    or lower:match("%.jpe?g$")
+    or lower:match("%.gif$")
+    or lower:match("%.webp$")
+    or lower:match("%.xlsx$")
+    or lower:match("%.docx$")
+    or lower:match("%.pptx$")
+    or lower:match("%.zip$")
+    or lower:match("%.gz$")
+    or lower:match("%.pdf$")
+    or lower:match("%.mp[34]$")
+    or lower:match("%.woff2?$")
+  then
+    return true
+  end
+  -- Store large non-XML binary blobs (> 64 KB) uncompressed to avoid expensive pure-Lua LZ77
+  if size >= 65536 and not lower:match("%.xml$") and not lower:match("%.rels$") then
+    return true
+  end
+  return false
 end
 
 -- Build a standard PKZIP byte string from `{ files = { [name] = content }, order = { ... } }`
 function M.write_zip_bytes(archive)
   local files = archive.files or {}
   local order = archive.order or {}
+  local raw_entries = archive.raw_entries
 
   -- Collect all filenames deterministically
   local seen = {}
@@ -814,18 +839,25 @@ function M.write_zip_bytes(archive)
     if content ~= nil then
       count = count + 1
       local uncomp_size = #content
-      local crc = M.crc32(content)
-      local method = 8
-      local comp_data
-      if is_precompressed_media(name, uncomp_size) then
-        method = 0
-        comp_data = content
+      local cached = raw_entries and raw_entries[name]
+      local crc, method, comp_data
+      if cached and cached.data == content and cached.raw_data and (cached.method == 0 or cached.method == 8) then
+        crc = cached.crc
+        method = cached.method
+        comp_data = cached.raw_data
       else
-        comp_data = M.deflate(content)
-        if #comp_data >= uncomp_size then
-          -- Store uncompressed if DEFLATE does not shrink the entry
+        crc = M.crc32(content)
+        method = 8
+        if is_precompressed_media(name, uncomp_size) then
           method = 0
           comp_data = content
+        else
+          comp_data = M.deflate(content)
+          if #comp_data >= uncomp_size then
+            -- Store uncompressed if DEFLATE does not shrink the entry
+            method = 0
+            comp_data = content
+          end
         end
       end
       local comp_size = #comp_data
