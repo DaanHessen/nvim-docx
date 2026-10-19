@@ -73,7 +73,7 @@ function M.docx_to_markdown_lines(docx_path, workspace)
 end
 
 function M.docx_to_markdown(docx_path, md_path, workspace)
-  local lines, err = M.docx_to_markdown_lines(docx_path, workspace)
+  local lines, err, archive, ast = M.docx_to_markdown_lines(docx_path, workspace)
   if not lines then
     return false, err
   end
@@ -85,7 +85,7 @@ function M.docx_to_markdown(docx_path, md_path, workspace)
     return false, err_msg
   end
 
-  return vim.fn.filereadable(md_path) == 1
+  return vim.fn.filereadable(md_path) == 1, nil, archive, ast
 end
 
 function M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, extra_opts)
@@ -102,9 +102,11 @@ function M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, ex
     return false, err_msg
   end
 
-  local ref_archive = nil
-  if opts.preserve_styles and reference_doc and reference_doc ~= "" and vim.fn.filereadable(reference_doc) == 1 then
+  local ref_archive = extra_opts and extra_opts.reference_archive or nil
+  if not ref_archive and opts.preserve_styles and reference_doc and reference_doc ~= "" and vim.fn.filereadable(reference_doc) == 1 then
     ref_archive = zip.read_zip(reference_doc)
+  elseif not opts.preserve_styles then
+    ref_archive = nil
   end
 
   local ok_compile, new_archive = pcall(ooxml.ast_to_docx, ast, ws, ref_archive, opts)
@@ -140,10 +142,10 @@ function M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, ex
     return false, err_msg
   end
 
-  return true
+  return true, nil, new_archive
 end
 
-function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc)
+function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc, extra_opts)
   local lines, read_err = utils.read_file_lines(md_path)
   if not lines then
     local err_msg = "Failed to read Markdown file: " .. tostring(read_err)
@@ -152,9 +154,8 @@ function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc)
   end
 
   local source_dir = vim.fn.fnamemodify(md_path, ":p:h")
-  return M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, {
-    source_dir = source_dir,
-  })
+  local merged_opts = vim.tbl_extend("force", { source_dir = source_dir }, extra_opts or {})
+  return M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, merged_opts)
 end
 
 function M.get_docx_info(docx_path)

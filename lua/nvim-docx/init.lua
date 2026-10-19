@@ -69,9 +69,12 @@ local function get_buffer_state(bufnr)
 end
 
 local function write_buffer_lines(bufnr, lines)
+  local old_ul = vim.bo[bufnr].undolevels
+  vim.bo[bufnr].undolevels = -1
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.bo[bufnr].modified = false
+  vim.bo[bufnr].undolevels = old_ul
 end
 
 function M.setup(opts)
@@ -99,9 +102,10 @@ function M.handle_docx_open(ev)
   local file_exists = (vim.fn.filereadable(docx_path) == 1)
   local workspace = utils.create_workspace(docx_path)
   local temp_md = utils.create_temp_md_file(workspace)
+  local loaded_archive = nil
 
   if file_exists then
-    local ok, conv_err = converter.docx_to_markdown(docx_path, temp_md, workspace)
+    local ok, conv_err, archive = converter.docx_to_markdown(docx_path, temp_md, workspace)
     if not ok then
       if config.options.auto_cleanup then
         utils.cleanup_temp_file(temp_md)
@@ -109,6 +113,7 @@ function M.handle_docx_open(ev)
       end
       error(conv_err or "Failed to open DOCX")
     end
+    loaded_archive = archive
 
     local content, err = utils.read_file_lines(temp_md)
     if not content then
@@ -134,6 +139,7 @@ function M.handle_docx_open(ev)
     original_path = docx_path,
     workspace = workspace,
     is_new = not file_exists,
+    reference_archive = loaded_archive,
   }
 
   if config.options.auto_cleanup then
@@ -210,7 +216,9 @@ function M.handle_docx_save(ev)
     ref_doc = nil
   end
 
-  local save_ok = converter.markdown_to_docx(temp_md, target_path, state.workspace, ref_doc)
+  local save_ok, _, new_archive = converter.markdown_to_docx(temp_md, target_path, state.workspace, ref_doc, {
+    reference_archive = (not state.is_new) and state.reference_archive or nil,
+  })
   if not save_ok then
     if config.options.auto_cleanup then
       utils.cleanup_temp_file(temp_md)
@@ -226,6 +234,9 @@ function M.handle_docx_save(ev)
 
   state.original_path = target_path
   state.is_new = false
+  if new_archive then
+    state.reference_archive = new_archive
+  end
   set_buffer_state(bufnr, state)
   vim.api.nvim_buf_set_name(bufnr, target_path)
   vim.bo[bufnr].modified = false
@@ -264,15 +275,23 @@ function M.docx_info(bufnr)
   local state = get_buffer_state(bufnr)
   local docx_path = state and state.original_path or resolve_docx_path(nil, bufnr)
 
-  if not docx_path or docx_path == "" or vim.fn.filereadable(docx_path) ~= 1 then
-    utils.notify("Current buffer is not backed by an existing .docx file on disk", "warn")
-    return nil
-  end
-
-  local stats, err = converter.get_docx_info(docx_path)
-  if not stats then
-    utils.notify("Failed to read DOCX info: " .. tostring(err), "error")
-    return nil
+  local stats, err
+  if state and (state.is_new or vim.bo[bufnr].modified or vim.fn.filereadable(docx_path) ~= 1) then
+    local markdown = require("nvim-docx.markdown")
+    local ooxml = require("nvim-docx.ooxml")
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    local ast = markdown.markdown_to_ast(lines, config.options)
+    stats = ooxml.get_docx_stats(state.reference_archive, ast)
+  else
+    if not docx_path or docx_path == "" or vim.fn.filereadable(docx_path) ~= 1 then
+      utils.notify("Current buffer is not backed by an existing .docx file on disk", "warn")
+      return nil
+    end
+    stats, err = converter.get_docx_info(docx_path)
+    if not stats then
+      utils.notify("Failed to read DOCX info: " .. tostring(err), "error")
+      return nil
+    end
   end
 
   local summary = {

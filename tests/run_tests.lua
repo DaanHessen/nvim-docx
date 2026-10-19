@@ -1,3 +1,4 @@
+vim.opt.rtp:prepend(".")
 vim.cmd("runtime! plugin/nvim-docx.lua")
 
 local zip = require("nvim-docx.zip")
@@ -760,6 +761,71 @@ add_test("advanced_ooxml_containers_and_charts", function()
   local ast3 = ooxml.docx_to_ast(arch2, test_dir, {})
   local md3 = markdown.ast_to_markdown(ast3)
   assert_equal(md3, md1, "Full round-trip preserves chart, SmartArt text, TextBox text, and symbols")
+end)
+
+add_test("18. Undo safety on open, .DOCX uppercase autocmd, numbering xmlns preservation, non-default officeDocument rels, and VP8L/TIFF/SVG dimensions", function()
+  local image = require("nvim-docx.image")
+  local ooxml = require("nvim-docx.ooxml")
+  local zip = require("nvim-docx.zip")
+  local docx = require("nvim-docx")
+
+  -- 1. VP8L lossless WebP dimensions (width=320, height=240)
+  -- bits = (w - 1) | ((h - 1) << 14) = 319 + 239 * 16384 = 3916095 = 0x003BC13F
+  local vp8l_bytes = "RIFF\24\0\0\0WEBPVP8L\12\0\0\0\47\63\193\59\0\0\0\0\0"
+  local vw, vh = image.get_pixel_dimensions(vp8l_bytes)
+  assert_equal(vw, 320, "VP8L width")
+  assert_equal(vh, 240, "VP8L height")
+
+  -- 2. Little-endian TIFF (width=640, height=480)
+  -- II\42\0, offset=8, 2 entries: tag 0x0100 SHORT(3) count=1 val=640 (0x0280), tag 0x0101 SHORT(3) count=1 val=480 (0x01E0)
+  local tiff_le = "II\42\0\8\0\0\0\2\0"
+    .. "\0\1\3\0\1\0\0\0\128\2\0\0"
+    .. "\1\1\3\0\1\0\0\0\224\1\0\0"
+  local tw, th = image.get_pixel_dimensions(tiff_le)
+  assert_equal(tw, 640, "TIFF LE width")
+  assert_equal(th, 480, "TIFF LE height")
+
+  -- 3. SVG dimensions from width/height and from viewBox
+  local svg1 = '<svg xmlns="http://www.w3.org/2000/svg" width="200px" height="100px"><rect/></svg>'
+  local sw1, sh1 = image.get_pixel_dimensions(svg1)
+  assert_equal(sw1, 200, "SVG width attribute")
+  assert_equal(sh1, 100, "SVG height attribute")
+
+  local svg2 = '<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 500 250"><rect/></svg>'
+  local sw2, sh2 = image.get_pixel_dimensions(svg2)
+  assert_equal(sw2, 500, "SVG viewBox width fallback")
+  assert_equal(sh2, 250, "SVG viewBox height fallback")
+
+  -- 4. Preserving extra xmlns:* attributes on numbering.xml (e.g., xmlns:w15) & non-default officeDocument path
+  local base_ast = markdown.markdown_to_ast({ "- Item 1" })
+  local arch = ooxml.ast_to_docx(base_ast, test_dir, nil, {})
+  -- Inject w15:restartNumberingAfterBreak on numbering.xml and relocate document.xml to document2.xml
+  arch.files["word/numbering.xml"] = arch.files["word/numbering.xml"]
+    :gsub('<w:numbering ', '<w:numbering xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml" ')
+    :gsub('<w:abstractNum w:abstractNumId="0">', '<w:abstractNum w:abstractNumId="0" w15:restartNumberingAfterBreak="0">')
+  arch.files["word/document2.xml"] = arch.files["word/document.xml"]
+  arch.files["word/document.xml"] = nil
+  arch.files["_rels/.rels"] = arch.files["_rels/.rels"]:gsub("word/document%.xml", "word/document2.xml")
+
+  local arch_rt = ooxml.ast_to_docx(base_ast, test_dir, arch, { preserve_styles = true })
+  assert_true(arch_rt.files["word/numbering.xml"]:find('xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"') ~= nil, "numbering.xml preserves xmlns:w15 declaration")
+  assert_true(arch_rt.files["_rels/.rels"]:find('Target="word/document.xml"') ~= nil, "_rels/.rels updated to point to word/document.xml")
+
+  -- 5. Uppercase .DOCX autocmd + pressing `u` immediately after opening does NOT wipe buffer
+  local upper_file = test_dir .. "/UPPERCASE_TEST.DOCX"
+  zip.write_zip(upper_file, arch_rt)
+  vim.cmd("edit " .. vim.fn.fnameescape(upper_file))
+  local bufnr = vim.api.nvim_get_current_buf()
+  local lines_before = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  assert_true(table.concat(lines_before, "\n"):find("Item 1") ~= nil, "Uppercase .DOCX loaded via autocmd")
+
+  -- Execute normal! u (undo) right after opening
+  vim.cmd("silent! normal! u")
+  local lines_after_undo = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  assert_equal(table.concat(lines_after_undo, "\n"), table.concat(lines_before, "\n"), "Pressing u after opening .docx does not wipe initial buffer content")
+
+  -- Also verify :DocxInfo runs without error on open buffer
+  docx.docx_info(bufnr)
 end)
 
 -- Main runner

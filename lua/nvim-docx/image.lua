@@ -133,22 +133,79 @@ function M.get_pixel_dimensions(bytes)
     end
   end
 
-  -- 5. WebP: RIFF....WEBP
-  if bytes:sub(1, 4) == "RIFF" and bytes:sub(9, 12) == "WEBP" and #bytes >= 30 then
+  -- 5. WebP: RIFF....WEBP (VP8, VP8L, VP8X)
+  if bytes:sub(1, 4) == "RIFF" and bytes:sub(9, 12) == "WEBP" and #bytes >= 25 then
     local chunk = bytes:sub(13, 16)
-    if chunk == "VP8 " then
+    if chunk == "VP8 " and #bytes >= 30 then
       local w = read_u16_le(bytes, 27)
       local h = read_u16_le(bytes, 29)
       if w and h then
         return (w % 16384), (h % 16384)
       end
-    elseif chunk == "VP8X" then
+    elseif chunk == "VP8L" and string.byte(bytes, 21) == 0x2F then
+      local bits = read_u32_le(bytes, 22)
+      if bits then
+        local w = (bits % 16384) + 1
+        local h = (math.floor(bits / 16384) % 16384) + 1
+        return w, h
+      end
+    elseif chunk == "VP8X" and #bytes >= 30 then
       local b1, b2, b3 = string.byte(bytes, 25, 27)
       local h1, h2, h3 = string.byte(bytes, 28, 30)
       if b3 and h3 then
         local w = 1 + b1 + b2 * 256 + b3 * 65536
         local h = 1 + h1 + h2 * 256 + h3 * 65536
         return w, h
+      end
+    end
+  end
+
+  -- 6. TIFF: II\42\0 (little-endian) or MM\0\42 (big-endian)
+  local tiff_hdr = bytes:sub(1, 4)
+  if (tiff_hdr == "II\42\0" or tiff_hdr == "MM\0\42") and #bytes >= 14 then
+    local u16 = (tiff_hdr == "II\42\0") and read_u16_le or read_u16_be
+    local u32 = (tiff_hdr == "II\42\0") and read_u32_le or read_u32_be
+    local ifd_off = u32(bytes, 5)
+    if ifd_off and ifd_off + 2 <= #bytes then
+      local count = u16(bytes, ifd_off + 1)
+      if count and count > 0 and count < 512 then
+        local w, h
+        for i = 0, count - 1 do
+          local epos = ifd_off + 3 + i * 12
+          if epos + 11 > #bytes then break end
+          local tag = u16(bytes, epos)
+          local ftype = u16(bytes, epos + 2)
+          local val = (ftype == 3) and u16(bytes, epos + 8) or u32(bytes, epos + 8)
+          if tag == 0x0100 then
+            w = val
+          elseif tag == 0x0101 then
+            h = val
+          end
+          if w and h then
+            return w, h
+          end
+        end
+      end
+    end
+  end
+
+  -- 7. SVG: <svg ... width="..." height="..." viewBox="...">
+  local head = bytes:sub(1, 2048)
+  local svg_attrs = head:match("<svg(%s[^>]*)/?>")
+  if svg_attrs then
+    local w_str = svg_attrs:match("%swidth%s*=%s*[\"']([^\"']+)[\"']")
+    local h_str = svg_attrs:match("%sheight%s*=%s*[\"']([^\"']+)[\"']")
+    local w_emu = w_str and not w_str:find("%%") and M.parse_length_to_emu(w_str) or nil
+    local h_emu = h_str and not h_str:find("%%") and M.parse_length_to_emu(h_str) or nil
+    if w_emu and h_emu then
+      return math.max(1, math.floor(w_emu / EMU_PER_PX + 0.5)),
+             math.max(1, math.floor(h_emu / EMU_PER_PX + 0.5))
+    end
+    local vb_w, vb_h = svg_attrs:match("viewBox%s*=%s*[\"']%s*[%-%d%.]+[%s,]+[%-%d%.]+[%s,]+([%d%.]+)[%s,]+([%d%.]+)%s*[\"']")
+    if vb_w and vb_h then
+      local vw, vh = tonumber(vb_w), tonumber(vb_h)
+      if vw and vh and vw > 0 and vh > 0 then
+        return math.max(1, math.floor(vw + 0.5)), math.max(1, math.floor(vh + 0.5))
       end
     end
   end

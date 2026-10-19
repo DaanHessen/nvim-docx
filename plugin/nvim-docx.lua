@@ -6,10 +6,12 @@ vim.g.loaded_nvim_docx = 1
 -- Create autocommand group
 local augroup = vim.api.nvim_create_augroup("NvimDocx", { clear = true })
 
+local docx_pattern = "*.[dD][oO][cC][xX]"
+
 -- Handle opening .docx files using custom reader
 vim.api.nvim_create_autocmd("BufReadCmd", {
   group = augroup,
-  pattern = "*.docx",
+  pattern = docx_pattern,
   callback = function(ev)
     require("nvim-docx").handle_docx_open(ev)
   end,
@@ -18,7 +20,7 @@ vim.api.nvim_create_autocmd("BufReadCmd", {
 -- Handle writing markdown back to DOCX
 vim.api.nvim_create_autocmd("BufWriteCmd", {
   group = augroup,
-  pattern = "*.docx",
+  pattern = docx_pattern,
   callback = function(ev)
     require("nvim-docx").handle_docx_save(ev)
   end,
@@ -27,7 +29,7 @@ vim.api.nvim_create_autocmd("BufWriteCmd", {
 -- Cleanup workspaces when buffers are deleted or wiped, or when Neovim exits
 vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
   group = augroup,
-  pattern = "*.docx",
+  pattern = docx_pattern,
   callback = function(ev)
     require("nvim-docx").handle_docx_close(ev)
   end,

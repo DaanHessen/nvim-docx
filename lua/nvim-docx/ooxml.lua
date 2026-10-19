@@ -2590,10 +2590,19 @@ end
 local function build_numbering_xml(list_defs, existing_numbering_xml)
   local abs_children = {}
   local num_children = {}
+  local root_attrs = {
+    ["xmlns:w"] = NS_W,
+    ["xmlns:r"] = NS_R,
+  }
 
   if existing_numbering_xml and existing_numbering_xml ~= "" then
     local ex_root = xml.parse(existing_numbering_xml)
     if ex_root then
+      for k, v in pairs(ex_root.attrs or {}) do
+        root_attrs[k] = v
+      end
+      root_attrs["xmlns:w"] = NS_W
+      root_attrs["xmlns:r"] = NS_R
       for _, c in ipairs(ex_root.children or {}) do
         if c.local_name == "abstractNum" then
           abs_children[#abs_children + 1] = c
@@ -2648,10 +2657,7 @@ local function build_numbering_xml(list_defs, existing_numbering_xml)
     children[#children + 1] = n
   end
 
-  local root = xml.elem("w:numbering", {
-    ["xmlns:w"] = NS_W,
-    ["xmlns:r"] = NS_R,
-  }, children)
+  local root = xml.elem("w:numbering", root_attrs, children)
   return xml.serialize(root)
 end
 
@@ -3410,7 +3416,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
     xml.elem("Relationships", { ["xmlns"] = NS_PKG_REL }, rel_elems)
   )
 
-  -- Ensure _rels/.rels exists
+  -- Ensure _rels/.rels exists and its officeDocument target points to word/document.xml
   if not archive.files["_rels/.rels"] then
     archive.files["_rels/.rels"] = xml.serialize(
       xml.elem("Relationships", { ["xmlns"] = NS_PKG_REL }, {
@@ -3419,6 +3425,23 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         xml.elem("Relationship", { ["Id"] = "rId3", ["Type"] = REL_EXT_PROPS, ["Target"] = "docProps/app.xml" }),
       })
     )
+  else
+    local rroot = xml.parse(archive.files["_rels/.rels"])
+    if rroot then
+      local rmod = false
+      for _, rel_node in ipairs(xml.find_children(rroot, "Relationship")) do
+        if xml.get_attr(rel_node, "Type") == REL_OFFICE_DOC then
+          local t = xml.get_attr(rel_node, "Target") or ""
+          if t ~= "word/document.xml" and t ~= "/word/document.xml" then
+            rel_node.attrs["Target"] = "word/document.xml"
+            rmod = true
+          end
+        end
+      end
+      if rmod then
+        archive.files["_rels/.rels"] = xml.serialize(rroot)
+      end
+    end
   end
 
   -- Ensure docProps/core.xml and docProps/app.xml exist (and apply metadata if provided)
