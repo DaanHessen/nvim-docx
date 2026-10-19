@@ -1,40 +1,47 @@
 local M = {}
 
+-- vim.health.start/ok/... arrived in 0.9; 0.8 has the report_* names
+local health = {
+  start = vim.health.start or vim.health.report_start,
+  ok = vim.health.ok or vim.health.report_ok,
+  info = vim.health.info or vim.health.report_info,
+  warn = vim.health.warn or vim.health.report_warn,
+  error = vim.health.error or vim.health.report_error,
+}
+
 function M.check()
-  vim.health.start("nvim-docx")
+  health.start("nvim-docx")
 
-  -- Check Neovim version
+  -- 1. Check Neovim version
   if vim.fn.has("nvim-0.8") == 1 then
-    vim.health.ok(string.format("Neovim version: %s", vim.version().string or ">= 0.8"))
+    health.ok(string.format("Neovim version: %s", vim.version().string or ">= 0.8"))
   else
-    vim.health.error("Neovim 0.8+ is required")
+    health.error("Neovim 0.8+ is required")
   end
 
-  -- Check Pandoc binary
-  local config = require("nvim-docx.config")
+  -- 2. Check native pure-Lua OOXML engine
   local converter = require("nvim-docx.converter")
-  local pandoc_bin = config.options.pandoc_path or "pandoc"
-  local available, version_str = converter.check_pandoc_available(true)
-
-  if available then
-    vim.health.ok(string.format("Pandoc executable found at '%s' (%s)", pandoc_bin, version_str))
+  local engine_ok, engine_info = converter.check_engine_available()
+  if engine_ok then
+    local jit_ver = ( _G.jit and _G.jit.version ) or _VERSION
+    health.ok(string.format("Native Lua OOXML engine active (%s, zero external dependencies)", jit_ver))
   else
-    vim.health.error(
-      string.format("Pandoc executable '%s' not found in PATH", pandoc_bin),
-      {
-        "Install pandoc using your system package manager (e.g. `sudo pacman -S pandoc`, `sudo apt install pandoc`, `brew install pandoc`)",
-        "Or configure `pandoc_path` in `require('nvim-docx').setup({ pandoc_path = '/path/to/pandoc' })`",
-      }
-    )
+    health.error("Native Lua OOXML engine self-test failed: " .. tostring(engine_info))
   end
 
-  -- Check Temp Directory
+  -- Configs written for the pandoc-based versions keep working; the option is simply unused now
+  local config = require("nvim-docx.config")
+  if config.options.pandoc_path then
+    health.info("`pandoc_path` is set but no longer used: nvim-docx no longer needs pandoc (safe to remove)")
+  end
+
+  -- 3. Check Temp Directory
   local utils = require("nvim-docx.utils")
   local temp_dir = utils.ensure_temp_dir()
   if vim.fn.isdirectory(temp_dir) == 1 then
-    vim.health.ok(string.format("Workspace cache directory writable: %s", temp_dir))
+    health.ok(string.format("Workspace cache directory writable: %s", temp_dir))
   else
-    vim.health.warn(
+    health.warn(
       string.format("Failed to create workspace cache directory: %s", temp_dir),
       { "Check directory permissions for stdpath('cache')" }
     )
