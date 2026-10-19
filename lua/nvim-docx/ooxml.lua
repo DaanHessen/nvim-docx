@@ -10,6 +10,8 @@ local zip = require("nvim-docx.zip")
 local M = {}
 
 local sort_rpr_children
+local run_attr_elements
+local normalize_run_attrs
 
 local NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 local NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1223,6 +1225,51 @@ local function resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
   return true, ordered, ilvl, start_val, abs_key, has_start_override
 end
 
+local RUN_ATTRS = { "font", "size", "color", "highlight" }
+
+local function each_text_node(inlines, fn)
+  for _, it in ipairs(inlines or {}) do
+    if it.type == "text" then
+      fn(it)
+    elseif it.inlines then
+      each_text_node(it.inlines, fn)
+    end
+  end
+end
+
+-- Keep font/size/color/highlight only on runs that differ from the paragraph's dominant look (by
+-- amount of text); the dominant look is the paragraph's own and is inherited when it is edited
+normalize_run_attrs = function(inlines)
+  local weight, by_sig = {}, {}
+  each_text_node(inlines, function(it)
+    local sig = table.concat({ tostring(it.font), tostring(it.size), tostring(it.color), tostring(it.highlight) }, "|")
+    weight[sig] = (weight[sig] or 0) + #(it.text or "")
+    by_sig[sig] = it
+  end)
+  local best, best_w = nil, -1
+  for sig, w in pairs(weight) do
+    if w > best_w then
+      best, best_w = sig, w
+    end
+  end
+  local dom = best and by_sig[best] or {}
+  local dominant = {}
+  for _, k in ipairs(RUN_ATTRS) do
+    dominant[k] = dom[k]
+  end
+  each_text_node(inlines, function(it)
+    for _, k in ipairs(RUN_ATTRS) do
+      if it[k] == dominant[k] then
+        it[k] = nil
+      elseif it[k] == nil and dominant[k] ~= nil then
+        -- a run without the attribute inside a paragraph that mostly has it: leave as is
+        it[k] = nil
+      end
+    end
+  end)
+  return inlines
+end
+
 -- Map a character in a symbol font (Symbol, Wingdings, ...) to Unicode; char_hex is its code in hex
 function M.decode_symbol(font, char_hex)
   return decode_w_sym(font, char_hex)
@@ -1541,6 +1588,7 @@ function M.docx_to_ast(archive, workspace, opts)
   local function extract_inlines_from_nodes(nodes, in_code_para, inherited_fmt, active_rels)
     local inlines = {}
     local found_hr = false
+    local page_break = nil
     local found_checkbox = nil
     local only_omath_para = false
     local omath_para_count = 0
@@ -1626,6 +1674,29 @@ function M.docx_to_ast(archive, workspace, opts)
               local s_node = xml.find_child(rpr, "strike") or xml.find_child(rpr, "dstrike")
               if s_node then rfmt.strike = is_bool_on(s_node) end
 
+              -- explicit font / size / color / highlight (shown as attribute spans when they differ
+              -- from the paragraph's dominant look, see normalize_run_attrs)
+              local rf = xml.find_child(rpr, "rFonts")
+              local rf_name = rf and (xml.get_attr(rf, "w:ascii") or xml.get_attr(rf, "w:hAnsi")) or nil
+              if rf_name and not MONOSPACE_FONTS[rf_name:lower()] then
+                rfmt.font = rf_name
+              end
+              local sz_node = xml.find_child(rpr, "sz")
+              local sz = sz_node and tonumber(xml.get_attr(sz_node, "w:val"))
+              if sz then
+                rfmt.size = sz / 2
+              end
+              local color_node = xml.find_child(rpr, "color")
+              local cval = color_node and xml.get_attr(color_node, "w:val")
+              if cval and cval:match("^%x%x%x%x%x%x$") and cval:upper() ~= "000000" then
+                rfmt.color = "#" .. cval:upper()
+              end
+              local hl_node = xml.find_child(rpr, "highlight")
+              local hval = hl_node and xml.get_attr(hl_node, "w:val")
+              if hval and hval ~= "none" then
+                rfmt.highlight = hval
+              end
+
               local u_node = xml.find_child(rpr, "u")
               if u_node then
                 local uval = (xml.get_attr(u_node, "w:val") or "single"):lower()
@@ -1706,7 +1777,7 @@ function M.docx_to_ast(archive, workspace, opts)
               elseif rlname == "br" or rlname == "cr" then
                 local br_type = xml.get_attr(rchild, "w:type")
                 if br_type == "page" then
-                  found_hr = true
+                  page_break = (#inlines > 0) and "after" or "before"
                 elseif in_code_para then
                   push_inline({ type = "text", text = "\n" })
                 else
@@ -1919,7 +1990,7 @@ function M.docx_to_ast(archive, workspace, opts)
     if omath_para_count == 1 and other_element_count == 0 then
       only_omath_para = true
     end
-    return markdown.merge_inlines(inlines), found_hr, found_checkbox, only_omath_para
+    return markdown.merge_inlines(inlines), found_hr, found_checkbox, only_omath_para, page_break
   end
 
   local trim_inlines = markdown.trim_inlines
@@ -1992,6 +2063,7 @@ function M.docx_to_ast(archive, workspace, opts)
   local ordered_counters = {}
   local seen_override_nums = {}
   local merged_into_prev_block = false
+  local page_break_after = false
 
   local function process_paragraph_inner(pnode)
     local ppr = xml.find_child(pnode, "pPr")
@@ -2025,7 +2097,16 @@ function M.docx_to_ast(archive, workspace, opts)
     end
 
     local is_code = is_code_para_style(styles, pstyle)
-    local inlines, found_hr, found_checkbox, only_omath_para = extract_inlines_from_nodes(pnode.children, is_code)
+    local inlines, found_hr, found_checkbox, only_omath_para, page_break = extract_inlines_from_nodes(pnode.children, is_code)
+    local ppr_node = xml.find_child(pnode, "pPr")
+    if not page_break and ppr_node and is_bool_on(xml.find_child(ppr_node, "pageBreakBefore")) then
+      page_break = "before"
+    end
+    if page_break == "before" then
+      ast.blocks[#ast.blocks + 1] = { type = "pagebreak" }
+    elseif page_break == "after" then
+      page_break_after = true
+    end
 
     if is_code then
       local raw_parts = {}
@@ -2054,6 +2135,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
 
     inlines = trim_inlines(inlines, false)
+    normalize_run_attrs(inlines)
 
     if found_hr or (has_bottom_border and #inlines == 0) then
       ast.blocks[#ast.blocks + 1] = { type = "hr" }
@@ -2165,7 +2247,11 @@ function M.docx_to_ast(archive, workspace, opts)
   -- Remember the source XML node of every block so a save can reuse it (see preserve.lua)
   local function process_paragraph(pnode)
     local n0 = #ast.blocks
+    page_break_after = false
     process_paragraph_inner(pnode)
+    if page_break_after then
+      ast.blocks[#ast.blocks + 1] = { type = "pagebreak" }
+    end
     for k = n0 + 1, #ast.blocks do
       ast.blocks[k]._pnode = pnode
     end
@@ -2226,6 +2312,7 @@ function M.docx_to_ast(archive, workspace, opts)
                 end
               end
               local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false), true)
+              normalize_run_attrs(pinl)
               if #pinl > 0 then
                 if #cell_inlines > 0 then
                   cell_inlines[#cell_inlines + 1] = { type = "linebreak" }
@@ -2414,6 +2501,20 @@ local function default_styles_xml()
     '<w:style w:type="paragraph" w:default="1" w:styleId="Normal">',
       '<w:name w:val="Normal"/><w:qFormat/>',
     '</w:style>',
+    '<w:style w:type="paragraph" w:styleId="Title">',
+      '<w:name w:val="Title"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>',
+      '<w:pPr><w:spacing w:after="80"/><w:contextualSpacing/></w:pPr>',
+      '<w:rPr><w:spacing w:val="-10"/><w:kern w:val="28"/><w:sz w:val="56"/><w:szCs w:val="56"/></w:rPr>',
+    '</w:style>',
+    '<w:style w:type="paragraph" w:styleId="Subtitle">',
+      '<w:name w:val="Subtitle"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>',
+      '<w:rPr><w:color w:val="595959"/><w:spacing w:val="15"/><w:sz w:val="28"/><w:szCs w:val="28"/></w:rPr>',
+    '</w:style>',
+    '<w:style w:type="paragraph" w:styleId="Quote">',
+      '<w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:qFormat/>',
+      '<w:pPr><w:spacing w:before="200" w:after="160"/><w:ind w:left="864" w:right="864"/><w:jc w:val="center"/></w:pPr>',
+      '<w:rPr><w:i/><w:iCs/><w:color w:val="404040"/></w:rPr>',
+    '</w:style>',
     '<w:style w:type="paragraph" w:styleId="FirstParagraph">',
       '<w:name w:val="First Paragraph"/><w:basedOn w:val="Normal"/><w:qFormat/>',
     '</w:style>',
@@ -2497,16 +2598,17 @@ end
 
 local function ensure_required_styles(styles_xml_str)
   if not styles_xml_str or styles_xml_str == "" then
-    return default_styles_xml(), {}
+    return ensure_required_styles(default_styles_xml())
   end
   local root = xml.parse(styles_xml_str)
   if not root then
-    return default_styles_xml(), {}
+    return ensure_required_styles(default_styles_xml())
   end
 
   local existing = {}
   local style_nodes = {}
   local heading_ids = {}
+  local name_to_id = {}
   for _, snode in ipairs(xml.find_children(root, "style")) do
     local sid = xml.get_attr(snode, "w:styleId")
     if sid then
@@ -2514,6 +2616,8 @@ local function ensure_required_styles(styles_xml_str)
       style_nodes[sid] = snode
       local name_node = xml.find_child(snode, "name")
       local sname = (name_node and xml.get_attr(name_node, "w:val") or sid):lower()
+      name_to_id[sname] = sid
+      name_to_id[sid:lower()] = name_to_id[sid:lower()] or sid
       local h_lvl = sname:match("^heading%s*([1-6])$") or sid:lower():match("^heading([1-6])$")
       if h_lvl then
         heading_ids[tonumber(h_lvl)] = sid
@@ -2549,15 +2653,18 @@ local function ensure_required_styles(styles_xml_str)
         end
       elseif sid and not existing[sid] then
         root.children[#root.children + 1] = def_style
+        local nn = xml.find_child(def_style, "name")
+        name_to_id[(nn and xml.get_attr(nn, "w:val") or sid):lower()] = sid
+        name_to_id[sid:lower()] = sid
         modified = true
       end
     end
   end
 
   if modified then
-    return xml.serialize(root), heading_ids, body_style_id
+    return xml.serialize(root), heading_ids, body_style_id, name_to_id
   end
-  return styles_xml_str, heading_ids, body_style_id
+  return styles_xml_str, heading_ids, body_style_id, name_to_id
 end
 
 local function build_numbering_xml(list_defs, existing_numbering_xml)
@@ -2752,16 +2859,18 @@ local function inheritable_run_props(pnode)
   if not pnode then
     return nil
   end
+  -- the run formatting covering the most text is the paragraph's own look
   local found = nil
+  local weights, rprs = {}, {}
   local function walk(node)
     for _, c in ipairs(node.children or {}) do
-      if found then
-        return
-      end
       if c.local_name == "r" then
-        if xml.find_child(c, "t") then
-          found = xml.find_child(c, "rPr") or false
-          return
+        local t = xml.find_child(c, "t")
+        if t then
+          local rpr = xml.find_child(c, "rPr")
+          local key = rpr and xml.serialize(rpr, { declaration = false }) or ""
+          weights[key] = (weights[key] or 0) + #(xml.get_all_text(t) or "")
+          rprs[key] = rpr or false
         end
       elseif c.local_name == "hyperlink" or c.local_name == "ins" or c.local_name == "smartTag"
         or c.local_name == "customXml" or c.local_name == "sdt" or c.local_name == "sdtContent"
@@ -2771,6 +2880,13 @@ local function inheritable_run_props(pnode)
     end
   end
   walk(pnode)
+  local best_w = -1
+  for key, w in pairs(weights) do
+    if w > best_w then
+      best_w = w
+      found = rprs[key]
+    end
+  end
   if not found then
     return nil
   end
@@ -2869,6 +2985,69 @@ local function max_numeric_attr(root, local_name, attr)
   end
   return max_v
 end
+
+-- Named colors accepted in color= attributes (anything else must be a hex value)
+local COLOR_NAMES = {
+  black = "000000", white = "FFFFFF", red = "FF0000", green = "00B050", blue = "0070C0",
+  yellow = "FFFF00", orange = "FFC000", purple = "7030A0", gray = "808080", grey = "808080",
+  darkred = "C00000", darkblue = "002060", lightblue = "00B0F0", lightgreen = "92D050",
+}
+
+local HIGHLIGHT_NAMES = {
+  yellow = true, green = true, cyan = true, magenta = true, blue = true, red = true, darkBlue = true,
+  darkCyan = true, darkGreen = true, darkMagenta = true, darkRed = true, darkYellow = true,
+  darkGray = true, lightGray = true, black = true, white = true,
+}
+
+local function color_hex(value)
+  if not value then
+    return nil
+  end
+  local hex = value:gsub("^#", "")
+  if hex:match("^%x%x%x%x%x%x$") then
+    return hex:upper()
+  end
+  if hex:match("^%x%x%x$") then
+    return (hex:sub(1, 1):rep(2) .. hex:sub(2, 2):rep(2) .. hex:sub(3, 3):rep(2)):upper()
+  end
+  return COLOR_NAMES[value:lower()]
+end
+
+-- <w:rPr> children for font / size (points) / color / highlight
+run_attr_elements = function(fmt)
+  local out = {}
+  if fmt.font and fmt.font ~= "" then
+    out[#out + 1] = xml.elem("w:rFonts", {
+      ["w:ascii"] = fmt.font, ["w:hAnsi"] = fmt.font, ["w:cs"] = fmt.font, ["w:eastAsia"] = fmt.font,
+    })
+  end
+  local size = tonumber(fmt.size)
+  if size and size > 0 then
+    local half_points = tostring(math.floor(size * 2 + 0.5))
+    out[#out + 1] = xml.elem("w:sz", { ["w:val"] = half_points })
+    out[#out + 1] = xml.elem("w:szCs", { ["w:val"] = half_points })
+  end
+  local color = color_hex(fmt.color)
+  if color then
+    out[#out + 1] = xml.elem("w:color", { ["w:val"] = color })
+  end
+  if fmt.highlight then
+    local hl = fmt.highlight
+    for name in pairs(HIGHLIGHT_NAMES) do
+      if name:lower() == hl:lower() then
+        hl = name
+      end
+    end
+    if HIGHLIGHT_NAMES[hl] then
+      out[#out + 1] = xml.elem("w:highlight", { ["w:val"] = hl })
+    elseif color_hex(hl) then
+      out[#out + 1] = xml.elem("w:shd", { ["w:val"] = "clear", ["w:color"] = "auto", ["w:fill"] = color_hex(hl) })
+    end
+  end
+  return out
+end
+
+M.color_hex = color_hex
 
 function M.ast_to_docx(doc, workspace, reference_archive, opts)
   opts = opts or {}
@@ -3006,7 +3185,8 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   end
 
   -- Ensure styles.xml exists and has required styles
-  local styles_xml, heading_style_ids, body_style_id = ensure_required_styles(archive.files["word/styles.xml"])
+  local styles_xml, heading_style_ids, body_style_id, style_name_to_id = ensure_required_styles(archive.files["word/styles.xml"])
+  style_name_to_id = style_name_to_id or {}
   archive.files["word/styles.xml"] = styles_xml
   add_rel(REL_STYLES, "styles.xml")
 
@@ -3154,6 +3334,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         elseif item.sub then
           rpr_children[#rpr_children + 1] = xml.elem("w:vertAlign", { ["w:val"] = "subscript" })
         end
+        vim.list_extend(rpr_children, run_attr_elements(item))
 
         if not item.code then
           rpr_children = merge_base_rpr(rpr_children)
@@ -3428,6 +3609,50 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
     return copy
   end
 
+  local generate_block_inner
+
+  -- Paragraph properties from section attributes: style="Name" and align=left|center|right|justify
+  local PPR_AFTER_JC = {
+    textDirection = true, textAlignment = true, textboxTightWrap = true, outlineLvl = true, divId = true,
+    cnfStyle = true, rPr = true, sectPr = true, pPrChange = true,
+  }
+  local ALIGN_VALUES = { left = "left", center = "center", centre = "center", right = "right", justify = "both", both = "both" }
+  local function apply_block_ppr(node, battrs)
+    local paras = node.local_name == "p" and { node } or xml.find_all(node, "p")
+    for _, p in ipairs(paras) do
+      local ppr = xml.find_child(p, "pPr")
+      if not ppr then
+        ppr = xml.elem("w:pPr")
+        table.insert(p.children, 1, ppr)
+      end
+      if battrs.style then
+        local sid = style_name_to_id[battrs.style:lower()] or battrs.style
+        local ps = xml.find_child(ppr, "pStyle")
+        if ps then
+          xml.set_attr(ps, "w:val", sid)
+        else
+          table.insert(ppr.children, 1, xml.elem("w:pStyle", { ["w:val"] = sid }))
+        end
+      end
+      local jc_val = battrs.align and ALIGN_VALUES[battrs.align:lower()]
+      if jc_val then
+        for k = #ppr.children, 1, -1 do
+          if ppr.children[k].local_name == "jc" then
+            table.remove(ppr.children, k)
+          end
+        end
+        local at = #ppr.children + 1
+        for k, c in ipairs(ppr.children) do
+          if PPR_AFTER_JC[c.local_name] then
+            at = k
+            break
+          end
+        end
+        table.insert(ppr.children, at, xml.elem("w:jc", { ["w:val"] = jc_val }))
+      end
+    end
+  end
+
   local function set_pstyle(ppr, style_id)
     local ps = xml.find_child(ppr, "pStyle")
     if ps then
@@ -3442,6 +3667,51 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   local function generate_block(i, block, src)
     local btype = block.type
     local src_pnode = src and src.type == btype and src._pnode or nil
+
+    if btype == "pagebreak" then
+      body_children[#body_children + 1] = xml.elem("w:p", nil, {
+        xml.elem("w:r", nil, { xml.elem("w:br", { ["w:type"] = "page" }) }),
+      })
+      return
+    end
+
+    -- ::: {...} section attributes: run defaults for everything inside, plus paragraph style/alignment
+    local battrs = block.attrs and block.attrs.kv or nil
+    if battrs then
+      local run_defaults = {
+        font = battrs.font,
+        -- headings keep their own size; the section size is for body text
+        size = btype ~= "heading" and battrs.size and tonumber((battrs.size:gsub("pt$", ""))) or nil,
+        color = battrs.color,
+        highlight = battrs.highlight,
+      }
+      local extra = run_attr_elements(run_defaults)
+      if #extra > 0 then
+        local replaced = {}
+        for _, e in ipairs(extra) do
+          replaced[e.local_name] = true
+        end
+        local merged = {}
+        for _, c in ipairs(base_rpr_children or {}) do
+          if not replaced[c.local_name] then
+            merged[#merged + 1] = c
+          end
+        end
+        vim.list_extend(merged, extra)
+        base_rpr_children = merged
+      end
+      local first_new = #body_children + 1
+      generate_block_inner(i, block, src, src_pnode)
+      for k = first_new, #body_children do
+        apply_block_ppr(body_children[k], battrs)
+      end
+      return
+    end
+    generate_block_inner(i, block, src, src_pnode)
+  end
+
+  generate_block_inner = function(i, block, src, src_pnode)
+    local btype = block.type
 
     -- (a patched table keeps its original note references, which are only valid if notes are kept)
     if btype == "table" and src_pnode and not (notes_rebuilt and node_has_note_refs(src_pnode)) then

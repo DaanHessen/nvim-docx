@@ -3,6 +3,8 @@
 -- (keeping direct formatting such as font sizes, colors, spacing and alignment) and let edited
 -- blocks inherit the formatting of the paragraph they replace.
 
+local markdown = require("nvim-docx.markdown")
+
 local M = {}
 
 -- Snapshot taken when a document is loaded: the Markdown shown to the user, the line range each
@@ -72,6 +74,7 @@ function M.map_blocks(source, new_lines, new_ranges, new_blocks)
       local i = first_old and old_line_block[first_old]
       local orig = i and orig_blocks[i]
       if orig and orig.type == block.type and old_ranges[i][1] == first_old
+        and markdown.block_attrs_sig(orig.attrs) == markdown.block_attrs_sig(block.attrs)
         and (old_ranges[i][2] - old_ranges[i][1]) == (r[2] - r[1]) then
         local all_same = true
         for l = r[1], r[2] do

@@ -2,29 +2,145 @@
 
 local M = {}
 
+-- Run formatting carried by text nodes. font/size/color/highlight come from attribute spans
+-- ([text]{font="Georgia" size=14 color=#C00000 highlight=yellow}); size is in points.
+local FMT_FLAGS = { "bold", "italic", "strike", "underline", "code", "sup", "sub" }
+local FMT_ATTRS = { "font", "size", "color", "highlight" }
+M.FMT_ATTRS = FMT_ATTRS
+
 local function clone_fmt(fmt)
-  if not fmt then
-    return {}
+  local out = {}
+  fmt = fmt or {}
+  for _, k in ipairs(FMT_FLAGS) do
+    out[k] = fmt[k] or false
   end
-  return {
-    bold = fmt.bold or false,
-    italic = fmt.italic or false,
-    strike = fmt.strike or false,
-    underline = fmt.underline or false,
-    code = fmt.code or false,
-    sup = fmt.sup or false,
-    sub = fmt.sub or false,
-  }
+  for _, k in ipairs(FMT_ATTRS) do
+    out[k] = fmt[k]
+  end
+  return out
 end
 
 local function same_fmt(a, b)
-  return (a.bold or false) == (b.bold or false)
-    and (a.italic or false) == (b.italic or false)
-    and (a.strike or false) == (b.strike or false)
-    and (a.underline or false) == (b.underline or false)
-    and (a.code or false) == (b.code or false)
-    and (a.sup or false) == (b.sup or false)
-    and (a.sub or false) == (b.sub or false)
+  for _, k in ipairs(FMT_FLAGS) do
+    if (a[k] or false) ~= (b[k] or false) then
+      return false
+    end
+  end
+  for _, k in ipairs(FMT_ATTRS) do
+    if a[k] ~= b[k] then
+      return false
+    end
+  end
+  return true
+end
+
+-- Parse a pandoc attribute block body ("font=\"Georgia\" size=14 .underline") into classes and keys
+function M.parse_attrs(body)
+  local attrs = { classes = {}, kv = {} }
+  local pos = 1
+  local len = #body
+  while pos <= len do
+    local ws = body:match("^%s+", pos)
+    if ws then
+      pos = pos + #ws
+    end
+    if pos > len then
+      break
+    end
+    local cls = body:match("^%.([%w%-_]+)", pos)
+    if cls then
+      attrs.classes[cls] = true
+      pos = pos + 1 + #cls
+    else
+      local key = body:match("^([%w%-_]+)=", pos)
+      if not key then
+        return nil
+      end
+      pos = pos + #key + 1
+      local q = body:sub(pos, pos)
+      local val
+      if q == '"' or q == "'" then
+        local close = body:find(q, pos + 1, true)
+        if not close then
+          return nil
+        end
+        val = body:sub(pos + 1, close - 1)
+        pos = close + 1
+      else
+        val = body:match("^[^%s}]+", pos) or ""
+        pos = pos + #val
+      end
+      attrs.kv[key] = val
+    end
+  end
+  return attrs
+end
+
+-- Run formatting from parsed attributes; nil when the attributes say nothing about runs
+local function fmt_from_attrs(attrs, base)
+  if not attrs then
+    return nil
+  end
+  local f = clone_fmt(base)
+  local any = false
+  local kv, cls = attrs.kv, attrs.classes
+  if kv.font or kv["font-family"] then
+    f.font = kv.font or kv["font-family"]
+    any = true
+  end
+  local size = kv.size or kv["font-size"]
+  if size then
+    local n = tonumber((size:gsub("pt$", "")))
+    if n and n > 0 then
+      f.size = n
+      any = true
+    end
+  end
+  if kv.color then
+    f.color = kv.color
+    any = true
+  end
+  if kv.highlight or cls.mark then
+    f.highlight = kv.highlight or "yellow"
+    any = true
+  end
+  if cls.underline or cls.ul then
+    f.underline = true
+    any = true
+  end
+  if cls.smallcaps then
+    any = true
+  end
+  return any and f or nil
+end
+M.fmt_from_attrs = fmt_from_attrs
+
+local function format_number(n)
+  if n == math.floor(n) then
+    return tostring(math.floor(n))
+  end
+  return tostring(n)
+end
+
+-- Canonical attribute text for a run's font/size/color/highlight (nil when it has none)
+function M.span_attrs(item)
+  local parts = {}
+  if item.font then
+    parts[#parts + 1] = string.format('font="%s"', item.font)
+  end
+  if item.size then
+    parts[#parts + 1] = "size=" .. format_number(item.size)
+  end
+  if item.color then
+    parts[#parts + 1] = "color=" .. item.color
+  end
+  if item.highlight then
+    parts[#parts + 1] = "highlight=" .. item.highlight
+  end
+  if #parts == 0 then
+    return nil
+  end
+  return "{" .. table.concat(parts, " ") .. "}"
 end
 
 function M.merge_inlines(inlines)
@@ -410,18 +526,14 @@ function M.parse_inlines(str, fmt)
             pos = pos + 1
           end
         elseif label and bracket_end then
-          local u_attr_s, u_attr_e = str:find("^%{%.underline%}", bracket_end + 1)
-          if not u_attr_s then
-            u_attr_s, u_attr_e = str:find("^%{%.ul%}", bracket_end + 1)
-          end
-          if u_attr_s and label ~= "" then
+          local a_s, a_e, a_body = str:find("^%{([^}]*)%}", bracket_end + 1)
+          local sub_fmt = a_s and label ~= "" and fmt_from_attrs(M.parse_attrs(a_body), fmt) or nil
+          if sub_fmt then
             flush_buf()
-            local sub_fmt = clone_fmt(fmt)
-            sub_fmt.underline = true
             for _, n in ipairs(M.parse_inlines(label, sub_fmt)) do
               out[#out + 1] = n
             end
-            pos = u_attr_e + 1
+            pos = a_e + 1
           else
             buf[#buf + 1] = ch
             pos = pos + 1
@@ -682,6 +794,8 @@ function M.render_inlines(inlines, opts)
 
   local stack = {}
   local pending_ws = ""
+  local opening_now = false
+  local closes_with_bold = false
   local function out(str)
     if str ~= "" then
       parts[#parts + 1] = str
@@ -710,8 +824,9 @@ function M.render_inlines(inlines, opts)
       end
       return "**", "**"
     elseif key == "italic" then
+      -- "*" right after a just-closed "**" would read as "***"; one opened together with bold is fine
       local prev = parts[#parts]
-      if starry or (prev and prev:sub(-1) == "*") then
+      if starry or (prev and prev:sub(-1) == "*" and not (opening_now and closes_with_bold)) then
         return "_", "_"
       end
       return "*", "*"
@@ -724,7 +839,27 @@ function M.render_inlines(inlines, opts)
     end
     return "~", "~"
   end
-  local function emit_text(item)
+  -- Does italic starting at merged[idx] end at the same run as the bold around it? ("***x***" is fine,
+  -- "***x*.**" is not)
+  local function italic_closes_with_bold(idx)
+    for j = idx, #merged do
+      local it = merged[j]
+      if it.type ~= "text" then
+        return true
+      end
+      local b, i = it.bold or false, it.italic or false
+      if b ~= i then
+        return false
+      end
+      if not b then
+        return true
+      end
+    end
+    return true
+  end
+
+  local function emit_text(item, idx)
+    closes_with_bold = italic_closes_with_bold(idx)
     local txt = item.text or ""
     local lead, core, trail
     if item.code then
@@ -745,8 +880,9 @@ function M.render_inlines(inlines, opts)
       pending_ws = pending_ws .. lead .. trail
       return
     end
+    local span = M.span_attrs(item)
     for idx, m in ipairs(stack) do
-      if not item[m.key] then
+      if (m.key == "span" and m.attrs ~= span) or (m.key ~= "span" and not item[m.key]) then
         close_from(idx)
         break
       end
@@ -757,30 +893,39 @@ function M.render_inlines(inlines, opts)
     for _, m in ipairs(stack) do
       open[m.key] = true
     end
+    if span and not open.span then
+      -- an attribute span must enclose the emphasis inside it, so reopen everything within it
+      close_from(1)
+      open = {}
+      out("[")
+      stack[#stack + 1] = { key = "span", attrs = span, close = "]" .. span }
+    end
+    opening_now = false
     for _, key in ipairs(MARK_ORDER) do
       if item[key] and not open[key] and not (key == "sub" and item.sup) then
         local o, c = marker(key, core)
         out(o)
         stack[#stack + 1] = { key = key, close = c }
+        opening_now = true
       end
     end
     out(core)
     pending_ws = trail
   end
 
-  for _, item in ipairs(merged) do
+  for item_idx, item in ipairs(merged) do
     if item.type ~= "text" and item.type ~= "tab" and item.type ~= "footnote_ref" then
       close_all()
     elseif item.type == "footnote_ref" then
       flush_ws()
     end
     if item.type == "text" then
-      emit_text(item)
+      emit_text(item, item_idx)
     elseif item.type == "link" then
-      -- link text is underlined by the Hyperlink style; that is not emphasis of its own
+      -- link text is blue and underlined by the Hyperlink style; that is not formatting of its own
       local label_inlines = {}
       for k, il in ipairs(item.inlines or {}) do
-        label_inlines[k] = il.underline and vim.tbl_extend("force", il, { underline = false }) or il
+        label_inlines[k] = (il.underline or il.color) and vim.tbl_extend("force", il, { underline = false, color = false }) or il
       end
       local label = M.render_inlines(label_inlines, opts)
       if label == "" then
@@ -1013,14 +1158,48 @@ function M.markdown_to_ast(lines, opts)
     return cur_list_level
   end
 
+  -- ::: {attrs} ... ::: sections; their attributes apply to every block inside
+  local div_stack = {}
+  local function current_div_attrs()
+    if #div_stack == 0 then
+      return nil
+    end
+    local merged = { kv = {}, classes = {} }
+    for _, a in ipairs(div_stack) do
+      for k, v in pairs(a.kv) do
+        merged.kv[k] = v
+      end
+      for k, v in pairs(a.classes) do
+        merged.classes[k] = v
+      end
+    end
+    return merged
+  end
+
   while idx <= n do
     local block_start_idx, block_count_before = idx, #doc.blocks
     local line = lines[idx]
     local fence, fence_lang = match_code_fence(line)
     local h_level, h_text = match_atx_heading(line)
+    local div_open = line:match("^%s*:::+%s*{(.*)}%s*$")
+    local div_class = not div_open and line:match("^%s*:::+%s*([%w%-_]+)%s*$")
+
+    if div_open or div_class then
+      div_stack[#div_stack + 1] = div_open and (M.parse_attrs(div_open) or { kv = {}, classes = {} })
+        or { kv = { style = div_class }, classes = {} }
+      idx = idx + 1
+
+    elseif line:match("^%s*:::+%s*$") and #div_stack > 0 then
+      table.remove(div_stack)
+      idx = idx + 1
+
+    -- Page break
+    elseif line:match("^%s*\\newpage%s*$") or line:match("^%s*\\pagebreak%s*$") then
+      doc.blocks[#doc.blocks + 1] = { type = "pagebreak" }
+      idx = idx + 1
 
     -- Skip blank lines
-    if line:match("^%s*$") then
+    elseif line:match("^%s*$") then
       idx = idx + 1
 
     -- Fenced code block ``` or ~~~
@@ -1323,6 +1502,12 @@ function M.markdown_to_ast(lines, opts)
         opts.block_ranges[k] = { block_start_idx, idx - 1 }
       end
     end
+    local div_attrs = current_div_attrs()
+    if div_attrs then
+      for k = block_count_before + 1, #doc.blocks do
+        doc.blocks[k].attrs = div_attrs
+      end
+    end
   end
 
   return doc
@@ -1355,6 +1540,32 @@ local function wrap_text_line(str, width)
   return #result > 0 and result or { "" }
 end
 
+-- Canonical "{...}" text of block attributes (nil when none)
+local BLOCK_ATTR_ORDER = { "style", "align", "font", "size", "color", "highlight" }
+function M.block_attrs_sig(attrs)
+  if not attrs then
+    return nil
+  end
+  local parts = {}
+  for _, k in ipairs(BLOCK_ATTR_ORDER) do
+    local v = attrs.kv and attrs.kv[k]
+    if v then
+      parts[#parts + 1] = (v:find("[%s\"]") or k == "font" or k == "style") and string.format('%s="%s"', k, v)
+        or (k .. "=" .. v)
+    end
+  end
+  local classes = {}
+  for c in pairs(attrs.classes or {}) do
+    classes[#classes + 1] = "." .. c
+  end
+  table.sort(classes)
+  vim.list_extend(parts, classes)
+  if #parts == 0 then
+    return nil
+  end
+  return "{" .. table.concat(parts, " ") .. "}"
+end
+
 function M.ast_to_markdown_lines(doc, opts)
   opts = opts or {}
   local lines = {}
@@ -1382,6 +1593,7 @@ function M.ast_to_markdown_lines(doc, opts)
 
   local list_counters = {}
   local rendered_list_level = -1
+  local open_div = nil
 
   for i, block in ipairs(blocks) do
     local btype = block.type
@@ -1406,9 +1618,32 @@ function M.ast_to_markdown_lines(doc, opts)
       end
     end
 
+    -- Open/close ::: sections when the block attributes change
+    local sig = M.block_attrs_sig(block.attrs)
+    if sig ~= open_div then
+      if open_div then
+        if lines[#lines] ~= "" then
+          lines[#lines + 1] = ""
+        end
+        lines[#lines + 1] = ":::"
+        lines[#lines + 1] = ""
+      end
+      if sig then
+        if #lines > 0 and lines[#lines] ~= "" then
+          lines[#lines + 1] = ""
+        end
+        lines[#lines + 1] = "::: " .. sig
+        lines[#lines + 1] = ""
+      end
+      open_div = sig
+    end
+
     local first_line = #lines + 1
 
-    if btype == "heading" then
+    if btype == "pagebreak" then
+      lines[#lines + 1] = "\\newpage"
+
+    elseif btype == "heading" then
       local lvl = math.min(math.max(tonumber(block.level) or 1, 1), 6)
       local prefix = string.rep("#", lvl) .. " "
       -- A heading is a single Markdown line; line breaks inside it become <br>
@@ -1526,6 +1761,11 @@ function M.ast_to_markdown_lines(doc, opts)
     if opts.block_ranges then
       opts.block_ranges[i] = { first_line, #lines }
     end
+  end
+
+  if open_div then
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = ":::"
   end
 
   if doc and doc.footnotes and #doc.footnotes > 0 then
