@@ -52,6 +52,12 @@ function M.check_engine_available()
   return false, tostring(inflated)
 end
 
+-- Kept for configs and scripts written against the pandoc-based versions: there is no external
+-- dependency any more, so this reports the built-in engine instead
+function M.check_pandoc_available()
+  return M.check_engine_available()
+end
+
 function M.docx_to_markdown_lines(docx_path, workspace)
   local opts = config.options or {}
   utils.debug("Reading DOCX/DOC archive: " .. tostring(docx_path))

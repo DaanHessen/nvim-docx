@@ -346,6 +346,15 @@ function M.handle_docx_write_range(ev)
   end
 end
 
+-- Write the document's images into its workspace (they are extracted on demand)
+function M.extract_media(bufnr)
+  local state = get_buffer_state(bufnr or vim.api.nvim_get_current_buf())
+  if state and state.workspace and state.reference_archive then
+    utils.ensure_dir(state.workspace .. "/media")
+    require("nvim-docx.ooxml").extract_media(state.reference_archive, state.workspace)
+  end
+end
+
 function M.handle_docx_close(ev)
   local bufnr = get_bufnr(ev)
   local state = get_buffer_state(bufnr)
@@ -444,10 +453,7 @@ function M.export_markdown(target_md_path, bufnr)
   end
 
   -- Media is only extracted on demand; make sure all of it is in the workspace before copying
-  if state and state.workspace and state.reference_archive then
-    utils.ensure_dir(state.workspace .. "/media")
-    require("nvim-docx.ooxml").extract_media(state.reference_archive, state.workspace)
-  end
+  M.extract_media(bufnr)
 
   -- Copy extracted media directory next to target_md_path if present
   if state and state.workspace and vim.fn.isdirectory(state.workspace .. "/media") == 1 then

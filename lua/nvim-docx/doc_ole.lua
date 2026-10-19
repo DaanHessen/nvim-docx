@@ -1675,6 +1675,10 @@ local function parse_doc(streams, wdoc, workspace, word6)
           vim.list_extend(blocks, pending_blocks)
           pending_blocks = {}
         end
+        -- a page or section break character ends the paragraph and starts a new page
+        if b == 12 and not is_note and not table_rows and #blocks > 0 and blocks[#blocks].type ~= "pagebreak" then
+          blocks[#blocks + 1] = { type = "pagebreak" }
+        end
         start = cp + 1
       end
       cp = cp + 1

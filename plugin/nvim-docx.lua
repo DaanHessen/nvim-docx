@@ -118,6 +118,9 @@ vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
 vim.api.nvim_create_autocmd("VimLeavePre", {
   group = augroup,
   callback = function()
+    if package.loaded["nvim-docx.preview"] then
+      require("nvim-docx.preview").stop_all()
+    end
     require("nvim-docx").cleanup_all_workspaces()
   end,
 })
@@ -142,3 +145,11 @@ end, {
   complete = "file",
   desc = "Compile the current Markdown buffer directly to a .docx file",
 })
+
+vim.api.nvim_create_user_command("DocxPreview", function()
+  require("nvim-docx.preview").start()
+end, { desc = "Open a live preview of the current document in the browser" })
+
+vim.api.nvim_create_user_command("DocxPreviewStop", function()
+  require("nvim-docx.preview").stop()
+end, { desc = "Stop the live preview of the current document" })

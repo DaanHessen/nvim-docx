@@ -135,9 +135,12 @@ end)
 
 -- Test 2: Checkhealth
 add_test("checkhealth_runs_without_error", function()
-  local health = require("nvim-docx.health")
-  local ok, err = pcall(health.check)
-  assert_true(ok, "health.check succeeded: " .. tostring(err))
+  local ok, err = pcall(vim.cmd, "checkhealth nvim-docx")
+  assert_true(ok, ":checkhealth nvim-docx succeeded: " .. tostring(err))
+  local report = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
+  assert_true(report:find("engine active", 1, true) ~= nil, "health report mentions the engine: " .. report)
+  assert_true(report:find("ERROR", 1, true) == nil, "health report has no errors: " .. report)
+  vim.cmd("bwipeout!")
 end)
 
 -- Test 3: Open rich docx, verify markdown buffer, edit, save, verify docx
@@ -761,6 +764,107 @@ add_test("advanced_ooxml_containers_and_charts", function()
   local ast3 = ooxml.docx_to_ast(arch2, test_dir, {})
   local md3 = markdown.ast_to_markdown(ast3)
   assert_equal(md3, md1, "Full round-trip preserves chart, SmartArt text, TextBox text, and symbols")
+end)
+
+add_test("lossless_save_keeps_direct_formatting_of_untouched_and_edited_blocks", function()
+  local docx = test_dir .. "/lossless.docx"
+  local ws = vim.fn.tempname()
+  vim.fn.mkdir(ws, "p")
+  assert_true(converter.markdown_lines_to_docx({
+    "::: {font=\"Georgia\" size=15}",
+    "",
+    "First paragraph in Georgia.",
+    "",
+    "Second paragraph in Georgia.",
+    "",
+    ":::",
+    "",
+    "Plain [big]{size=20} word.",
+  }, docx, ws, nil, {}), "fixture written")
+
+  vim.cmd("edit " .. vim.fn.fnameescape(docx))
+  local bufnr = vim.api.nvim_get_current_buf()
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local text = table.concat(lines, "\n")
+  assert_true(text:find("[big]{size=20}", 1, true) ~= nil, "differing run size is shown: " .. text)
+  assert_true(text:find("font=\"Georgia\"", 1, true) == nil, "paragraph's own font is not shown: " .. text)
+  for i, l in ipairs(lines) do
+    if l:find("Second paragraph", 1, true) then
+      lines[i] = "Second paragraph, edited in Neovim."
+    end
+  end
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.cmd("write")
+  vim.cmd("bwipeout!")
+
+  local arch = assert(zip.read_zip(docx))
+  local doc = arch.files["word/document.xml"]
+  assert_true(doc:find("edited in Neovim", 1, true) ~= nil, "edit saved")
+  assert_true(select(2, doc:gsub('w:ascii="Georgia"', "")) >= 2, "Georgia kept on untouched and edited paragraphs")
+  assert_true(doc:find('w:sz w:val="40"', 1, true) ~= nil, "20 pt run kept")
+  assert_true(select(2, doc:gsub('w:sz w:val="30"', "")) >= 2, "15 pt kept on both paragraphs")
+end)
+
+add_test("attribute_spans_sections_and_page_breaks_roundtrip", function()
+  local src = {
+    "::: {style=\"Quote\"}",
+    "",
+    "A quote paragraph.",
+    "",
+    ":::",
+    "",
+    "Text with [red 14 pt]{size=14 color=#FF0000} and [marked]{highlight=yellow}.",
+    "",
+    "\\newpage",
+    "",
+    "Literal *stars*, a\\_b, \\$5 and ***bold italic*** stay intact: \\*not emphasis\\*.",
+  }
+  local out = test_dir .. "/attrs.docx"
+  local ws = vim.fn.tempname()
+  vim.fn.mkdir(ws, "p")
+  assert_true(converter.markdown_lines_to_docx(src, out, ws, nil, {}), "attrs doc written")
+  local arch = assert(zip.read_zip(out))
+  local doc = arch.files["word/document.xml"]
+  assert_true(doc:find('<w:pStyle w:val="Quote"/>', 1, true) ~= nil, "Quote style applied")
+  assert_true(doc:find('<w:color w:val="FF0000"/>', 1, true) ~= nil, "color applied")
+  assert_true(doc:find('<w:highlight w:val="yellow"/>', 1, true) ~= nil, "highlight applied")
+  assert_true(doc:find('<w:br w:type="page"/>', 1, true) ~= nil, "page break written")
+  local back = table.concat(converter.docx_to_markdown_lines(out, nil), "\n")
+  assert_true(back:find("[red 14 pt]{size=14 color=#FF0000}", 1, true) ~= nil, "span read back: " .. back)
+  assert_true(back:find("\\newpage", 1, true) ~= nil, "page break read back")
+  assert_true(back:find("Literal *stars*, a_b, \\$5 and ***bold italic*** stay intact: \\*not emphasis\\*.", 1, true) ~= nil,
+    "escaping round-trips: " .. back)
+end)
+
+add_test("live_preview_renders_html", function()
+  local preview = require("nvim-docx.preview")
+  local html = preview.render_html({
+    "# Title",
+    "",
+    "Some **bold** and [red]{color=red}.",
+    "",
+    "- a",
+    "- b",
+    "1. one",
+    "",
+    "| A | B |",
+    "| :--- | ---: |",
+    "| 1 | 2 |",
+  })
+  assert_true(html:find("<h1>Title</h1>", 1, true) ~= nil, "heading: " .. html)
+  assert_true(html:find("<strong>bold</strong>", 1, true) ~= nil, "bold")
+  assert_true(html:find("color:#FF0000", 1, true) ~= nil, "span color")
+  assert_true(html:find("</ul>\n<ol>", 1, true) ~= nil, "bullet then numbered list: " .. html)
+  assert_true(html:find('<td style="text-align:right">2</td>', 1, true) ~= nil, "table alignment")
+end)
+
+add_test("zip_plugin_does_not_claim_word_files", function()
+  local docx = test_dir .. "/rich.docx"
+  vim.cmd("edit " .. vim.fn.fnameescape(docx))
+  assert_equal(vim.bo.readonly, false, "buffer is not readonly")
+  assert_equal(vim.bo.buftype, "acwrite", "buffer is acwrite")
+  assert_equal(vim.bo.filetype, "markdown", "filetype markdown")
+  vim.cmd("bwipeout!")
 end)
 
 add_test("18. Undo safety on open, .DOCX uppercase autocmd, numbering xmlns preservation, non-default officeDocument rels, and VP8L/TIFF/SVG dimensions", function()
