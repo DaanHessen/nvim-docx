@@ -49,12 +49,22 @@ local function cleanup_state_files(state)
   end
 end
 
+-- Full per-buffer state lives on the Lua side: it holds the loaded archive and parsed XML, which must
+-- not be copied into a buffer variable. vim.b keeps a small summary for statuslines and scripts.
+local buffer_states = {}
+
 local function set_buffer_state(bufnr, state)
+  buffer_states[bufnr] = state
   if state then
     if state.workspace then
       active_workspaces[state.workspace] = state
     end
-    vim.b[bufnr].nvim_docx_state = state
+    vim.b[bufnr].nvim_docx_state = {
+      original_path = state.original_path,
+      workspace = state.workspace,
+      is_new = state.is_new,
+      legacy = state.legacy,
+    }
     vim.b[bufnr].nvim_docx_active = true
     vim.b[bufnr].nvim_docx_original_path = state.original_path
   else
@@ -65,7 +75,7 @@ local function set_buffer_state(bufnr, state)
 end
 
 local function get_buffer_state(bufnr)
-  return vim.b[bufnr].nvim_docx_state
+  return buffer_states[bufnr]
 end
 
 local function write_buffer_lines(bufnr, lines)
@@ -103,9 +113,10 @@ function M.handle_docx_open(ev)
   local workspace = utils.create_workspace(docx_path)
   local temp_md = utils.create_temp_md_file(workspace)
   local loaded_archive = nil
+  local loaded_source = nil
 
   if file_exists then
-    local ok, conv_err, archive = converter.docx_to_markdown(docx_path, temp_md, workspace)
+    local ok, conv_err, archive, _, source = converter.docx_to_markdown(docx_path, temp_md, workspace)
     if not ok then
       if config.options.auto_cleanup then
         utils.cleanup_temp_file(temp_md)
@@ -114,6 +125,7 @@ function M.handle_docx_open(ev)
       error(conv_err or "Failed to open DOCX")
     end
     loaded_archive = archive
+    loaded_source = source
 
     local content, err = utils.read_file_lines(temp_md)
     if not content then
@@ -133,13 +145,18 @@ function M.handle_docx_open(ev)
 
   vim.bo[bufnr].filetype = "markdown"
   vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].readonly = false
+  vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].modified = false
 
   local state = {
     original_path = docx_path,
     workspace = workspace,
     is_new = not file_exists,
+    -- Word 97-2003 binary: readable, but saves go to a .docx next to it
+    legacy = file_exists and loaded_archive == nil,
     reference_archive = loaded_archive,
+    preserve_source = loaded_source,
   }
 
   if config.options.auto_cleanup then
@@ -149,7 +166,20 @@ function M.handle_docx_open(ev)
   end
 
   set_buffer_state(bufnr, state)
-  if file_exists then
+  vim.schedule(function()
+    if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].nvim_docx_active then
+      if vim.bo[bufnr].filetype ~= "markdown" then
+        vim.bo[bufnr].filetype = "markdown"
+      end
+    end
+  end)
+  if state.legacy then
+    utils.notify(
+      "Editing Word 97-2003 document as Markdown: " .. vim.fn.fnamemodify(docx_path, ":t")
+        .. " (:w saves to " .. vim.fn.fnamemodify(docx_path, ":t:r") .. ".docx)",
+      "info"
+    )
+  elseif file_exists then
     utils.notify("Editing DOCX as Markdown: " .. vim.fn.fnamemodify(docx_path, ":t"), "info")
   else
     utils.notify("New DOCX buffer (saves to: " .. vim.fn.fnamemodify(docx_path, ":t") .. ")", "info")
@@ -203,6 +233,22 @@ function M.handle_docx_save(ev)
     return
   end
 
+  -- The binary Word 97-2003 format cannot be written; save as .docx next to it instead of
+  -- overwriting the original with a file in a different format
+  if utils.is_legacy_word_ext(target_path) then
+    local docx_target = vim.fn.fnamemodify(target_path, ":r") .. ".docx"
+    if vim.fn.filereadable(docx_target) == 1 and docx_target ~= state.legacy_target then
+      utils.notify(
+        "Not overwriting existing " .. vim.fn.fnamemodify(docx_target, ":t")
+          .. "; save with :w <name>.docx",
+        "error"
+      )
+      return
+    end
+    state.legacy_target = docx_target
+    target_path = docx_target
+  end
+
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   local temp_md = utils.create_temp_md_file(state.workspace)
   local ok, write_err = utils.write_file_lines(temp_md, lines)
@@ -218,6 +264,7 @@ function M.handle_docx_save(ev)
 
   local save_ok, _, new_archive = converter.markdown_to_docx(temp_md, target_path, state.workspace, ref_doc, {
     reference_archive = (not state.is_new) and state.reference_archive or nil,
+    preserve_source = (not state.is_new) and state.preserve_source or nil,
   })
   if not save_ok then
     if config.options.auto_cleanup then
@@ -232,15 +279,71 @@ function M.handle_docx_save(ev)
     state.last_temp_file = temp_md
   end
 
+  if target_path ~= state.original_path then
+    utils.notify("Saved as " .. target_path, "info")
+  end
   state.original_path = target_path
   state.is_new = false
+  state.legacy = false
   if new_archive then
     state.reference_archive = new_archive
+    -- Next save diffs against what was just written
+    local ok_src, src = pcall(converter.source_from_archive, new_archive)
+    state.preserve_source = ok_src and src or nil
   end
   set_buffer_state(bufnr, state)
   vim.api.nvim_buf_set_name(bufnr, target_path)
   vim.bo[bufnr].modified = false
   utils.notify("Saved DOCX: " .. vim.fn.fnamemodify(target_path, ":t"), "info")
+end
+
+-- ":read file.docx": insert the converted Markdown below the cursor line ('[ for :0read)
+function M.handle_docx_read(ev)
+  local bufnr = get_bufnr(ev)
+  local path = absolute_path(ev and (ev.file ~= "" and ev.file or ev.match) or "")
+  if vim.fn.filereadable(path) ~= 1 then
+    utils.notify("Cannot read " .. path, "error")
+    return
+  end
+  local state = get_buffer_state(bufnr)
+  local ws = (state and state.workspace) or utils.create_workspace(path)
+  local lines, err = converter.docx_to_markdown_lines(path, ws)
+  if not state then
+    utils.cleanup_workspace(ws)
+  end
+  if not lines then
+    utils.notify("Failed to read " .. vim.fn.fnamemodify(path, ":t") .. ": " .. tostring(err), "error")
+    return
+  end
+  local after = vim.fn.line("'[")
+  if after < 0 then
+    after = 0
+  end
+  vim.api.nvim_buf_set_lines(bufnr, after, after, false, lines)
+end
+
+-- ":'<,'>write part.docx": compile just those lines into a new document
+function M.handle_docx_write_range(ev)
+  local bufnr = get_bufnr(ev)
+  local target = absolute_path(ev and (ev.file ~= "" and ev.file or ev.match) or "")
+  if utils.is_legacy_word_ext(target) then
+    target = vim.fn.fnamemodify(target, ":r") .. ".docx"
+  end
+  local first, last = vim.fn.line("'["), vim.fn.line("']")
+  local lines = vim.api.nvim_buf_get_lines(bufnr, math.max(first - 1, 0), last, false)
+  local state = get_buffer_state(bufnr)
+  local cur_name = vim.api.nvim_buf_get_name(bufnr)
+  local ws = utils.create_workspace(target)
+  -- Images extracted from the source document live in its workspace
+  local ok, err = converter.markdown_lines_to_docx(lines, target, ws, nil, {
+    source_dir = (state and state.workspace) or (cur_name ~= "" and vim.fn.fnamemodify(cur_name, ":p:h")) or vim.fn.getcwd(),
+  })
+  utils.cleanup_workspace(ws)
+  if ok then
+    utils.notify(string.format("Wrote %d lines to %s", #lines, vim.fn.fnamemodify(target, ":t")), "info")
+  else
+    utils.notify("Failed to write " .. target .. ": " .. tostring(err), "error")
+  end
 end
 
 function M.handle_docx_close(ev)
@@ -338,6 +441,12 @@ function M.export_markdown(target_md_path, bufnr)
   if not ok then
     utils.notify("Failed to export Markdown: " .. tostring(err), "error")
     return false
+  end
+
+  -- Media is only extracted on demand; make sure all of it is in the workspace before copying
+  if state and state.workspace and state.reference_archive then
+    utils.ensure_dir(state.workspace .. "/media")
+    require("nvim-docx.ooxml").extract_media(state.reference_archive, state.workspace)
   end
 
   -- Copy extracted media directory next to target_md_path if present

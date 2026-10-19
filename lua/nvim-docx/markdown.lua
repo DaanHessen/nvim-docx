@@ -54,6 +54,89 @@ end
 --------------------------------------------------------------------------------
 
 -- Helper to match balanced [...] starting at `pos` (where str:sub(pos, pos) == "[")
+-- Drop leading/trailing tabs, line breaks and spaces of a paragraph (Word keeps them, Markdown cannot)
+-- and the whitespace around interior line breaks. Leading spaces are kept unless trim_leading_spaces.
+function M.trim_inlines(inlines, trim_leading_spaces)
+  if not inlines then
+    return {}
+  end
+  while #inlines > 0 do
+    local first = inlines[1]
+    if first.type == "tab" or first.type == "linebreak" then
+      table.remove(inlines, 1)
+    elseif trim_leading_spaces and first.type == "text" then
+      first.text = (first.text or ""):gsub("^[ \t]+", "")
+      if first.text == "" then
+        table.remove(inlines, 1)
+      else
+        break
+      end
+    else
+      break
+    end
+  end
+  while #inlines > 0 do
+    local last = inlines[#inlines]
+    if last.type == "tab" or last.type == "linebreak" then
+      table.remove(inlines, #inlines)
+    elseif last.type == "text" then
+      last.text = (last.text or ""):gsub("[ \t]+$", "")
+      if last.text == "" then
+        table.remove(inlines, #inlines)
+      else
+        break
+      end
+    else
+      break
+    end
+  end
+  -- Clean up spaces/tabs adjacent to interior linebreaks and collapse consecutive linebreaks
+  local i = 1
+  while i <= #inlines do
+    if inlines[i].type == "linebreak" then
+      -- Trim trailing spaces/tabs before linebreak
+      if i > 1 then
+        local prev = inlines[i - 1]
+        if prev.type == "tab" then
+          table.remove(inlines, i - 1)
+          i = i - 1
+        elseif prev.type == "text" then
+          prev.text = (prev.text or ""):gsub("[ \t]+$", "")
+          if prev.text == "" then
+            table.remove(inlines, i - 1)
+            i = i - 1
+          end
+        end
+      end
+      -- Trim leading spaces/tabs or duplicate linebreaks after linebreak
+      while i + 1 <= #inlines do
+        local nxt = inlines[i + 1]
+        if nxt.type == "linebreak" or nxt.type == "tab" then
+          table.remove(inlines, i + 1)
+        elseif nxt.type == "text" then
+          nxt.text = (nxt.text or ""):gsub("^[ \t]+", "")
+          if nxt.text == "" then
+            table.remove(inlines, i + 1)
+          else
+            break
+          end
+        else
+          break
+        end
+      end
+    end
+    i = i + 1
+  end
+  -- Re-check leading/trailing linebreak in case interior cleanup exposed one
+  while #inlines > 0 and (inlines[1].type == "linebreak" or inlines[1].type == "tab") do
+    table.remove(inlines, 1)
+  end
+  while #inlines > 0 and (inlines[#inlines].type == "linebreak" or inlines[#inlines].type == "tab") do
+    table.remove(inlines, #inlines)
+  end
+  return M.merge_inlines(inlines)
+end
+
 local function match_bracketed(str, pos)
   if str:sub(pos, pos) ~= "[" then
     return nil, nil
@@ -147,6 +230,29 @@ local function is_alnum(ch)
   return ch ~= "" and ch:match("^[%w]$") ~= nil
 end
 
+-- ^sup^ / ~sub~ starting at pos: content may not contain unescaped whitespace (pandoc rules; a space
+-- is written as "\ "). Returns start, end, content.
+local function find_script(str, pos, delim)
+  local i = pos + 1
+  local len = #str
+  while i <= len do
+    local c = str:sub(i, i)
+    if c == "\\" then
+      i = i + 2
+    elseif c:match("%s") then
+      return nil
+    elseif c == delim then
+      if i == pos + 1 then
+        return nil
+      end
+      return pos, i, str:sub(pos + 1, i - 1)
+    else
+      i = i + 1
+    end
+  end
+  return nil
+end
+
 function M.parse_inlines(str, fmt)
   fmt = clone_fmt(fmt)
   local out = {}
@@ -174,7 +280,7 @@ function M.parse_inlines(str, fmt)
     -- 1. Escaped punctuation
     if ch == "\\" and pos < len then
       local next_ch = str:sub(pos + 1, pos + 1)
-      if next_ch:match("^[\\`%*_%{%}%[%]%(%)#%+%-%.,!|~^<>]$") then
+      if next_ch:match("^[\\`%*_%{%}%[%]%(%)#%+%-%.,!|~^<>$:= ]$") then
         buf[#buf + 1] = next_ch
         pos = pos + 2
       else
@@ -413,7 +519,7 @@ function M.parse_inlines(str, fmt)
           pos = pos + 2
         end
       else
-        local sub_s, sub_e, sub_txt = str:find("^~([^~%s]+)~", pos)
+        local sub_s, sub_e, sub_txt = find_script(str, pos, "~")
         if sub_s then
           flush_buf()
           local sub_fmt = clone_fmt(fmt)
@@ -430,7 +536,7 @@ function M.parse_inlines(str, fmt)
 
     -- 8. Superscript ^...^
     elseif ch == "^" then
-      local sup_s, sup_e, sup_txt = str:find("^%^([^%^%s]+)%^", pos)
+      local sup_s, sup_e, sup_txt = find_script(str, pos, "^")
       if sup_s then
         flush_buf()
         local sub_fmt = clone_fmt(fmt)
@@ -497,95 +603,75 @@ end
 -- Inline Renderer (AST inlines -> Markdown string)
 --------------------------------------------------------------------------------
 
-local function format_text_span(node)
-  local txt = node.text or ""
-  if txt == "" then
-    return ""
-  end
-
-  local has_style = node.bold or node.italic or node.strike or node.underline or node.sup or node.sub
-
-  if node.code then
-    local code_span
-    if txt:find("`", 1, true) then
-      local pad = (txt:sub(1, 1) == "`" or txt:sub(-1) == "`") and " " or ""
-      code_span = "``" .. pad .. txt .. pad .. "``"
+-- Backslash-escape characters in plain document text that the inline parser would otherwise read as
+-- Markdown syntax, so text such as "*", "$5 and $10" or "a_b_c" survives a round trip unchanged
+local function escape_inline_text(txt)
+  local out = {}
+  local len = #txt
+  for i = 1, len do
+    local ch = txt:sub(i, i)
+    local nxt = txt:sub(i + 1, i + 1)
+    if ch == "\\" or ch == "*" or ch == "`" or ch == "$" or ch == "~" or ch == "^" then
+      out[#out + 1] = "\\" .. ch
+    elseif ch == "_" then
+      -- intraword underscores (snake_case) are never emphasis
+      local prev = txt:sub(i - 1, i - 1)
+      if prev:match("%w") and nxt:match("%w") then
+        out[#out + 1] = ch
+      else
+        out[#out + 1] = "\\_"
+      end
+    elseif ch == "[" then
+      -- only brackets that would form a link, image, footnote or attribute span need escaping
+      local close = txt:find("]", i + 1, true)
+      local after = close and txt:sub(close + 1, close + 1) or ""
+      if nxt == "^" or after == "(" or after == "{" or after == "[" then
+        out[#out + 1] = "\\["
+      else
+        out[#out + 1] = ch
+      end
+    elseif ch == "<" and nxt:match("[%a/!]") then
+      out[#out + 1] = "\\<"
     else
-      code_span = "`" .. txt .. "`"
+      out[#out + 1] = ch
     end
-    if not has_style then
-      return code_span
-    end
-    local open_m, close_m = "", ""
-    if node.bold and node.italic then
-      open_m = open_m .. "***"
-      close_m = "***" .. close_m
-    elseif node.bold then
-      open_m = open_m .. "**"
-      close_m = "**" .. close_m
-    elseif node.italic then
-      open_m = open_m .. "*"
-      close_m = "*" .. close_m
-    end
-    if node.strike then
-      open_m = open_m .. "~~"
-      close_m = "~~" .. close_m
-    end
-    if node.underline then
-      open_m = open_m .. "<u>"
-      close_m = "</u>" .. close_m
-    end
-    if node.sup then
-      open_m = open_m .. "^"
-      close_m = "^" .. close_m
-    elseif node.sub then
-      open_m = open_m .. "~"
-      close_m = "~" .. close_m
-    end
-    return open_m .. code_span .. close_m
   end
-
-  if not has_style then
-    return txt
-  end
-
-  local lead, core, trail = txt:match("^(%s*)(.-)(%s*)$")
-  if not core or core == "" then
-    return txt
-  end
-
-  local open_m, close_m = "", ""
-  if node.bold and node.italic then
-    open_m = open_m .. "***"
-    close_m = "***" .. close_m
-  elseif node.bold then
-    open_m = open_m .. "**"
-    close_m = "**" .. close_m
-  elseif node.italic then
-    open_m = open_m .. "*"
-    close_m = "*" .. close_m
-  end
-
-  if node.strike then
-    open_m = open_m .. "~~"
-    close_m = "~~" .. close_m
-  end
-
-  if node.underline then
-    open_m = open_m .. "<u>"
-    close_m = "</u>" .. close_m
-  end
-
-  if node.sup then
-    open_m = open_m .. "^"
-    close_m = "^" .. close_m
-  elseif node.sub then
-    open_m = open_m .. "~"
-    close_m = "~" .. close_m
-  end
-
-  return lead .. open_m .. core .. close_m .. trail
+  return table.concat(out)
 end
+
+M.escape_inline_text = escape_inline_text
+
+-- Escape a rendered paragraph whose first characters would start a different block (list, heading,
+-- quote, table, fence, footnote definition, horizontal rule)
+local function escape_block_start(text)
+  local lead, rest = text:match("^(%s*)(.*)$")
+  if rest == "" then
+    return text
+  end
+  local num, delim = rest:match("^(%d+)([.)])%s")
+  if num then
+    return lead .. num .. "\\" .. rest:sub(#num + 1)
+  end
+  if rest:match("^[#>|+-]") or rest:match("^[=-][=-]+%s*$") or rest:match("^:::") then
+    return lead .. "\\" .. rest
+  end
+  return text
+end
+
+M.escape_block_start = escape_block_start
+
+local function code_span(txt)
+  if txt:find("`", 1, true) then
+    local pad = (txt:sub(1, 1) == "`" or txt:sub(-1) == "`") and " " or ""
+    return "``" .. pad .. txt .. pad .. "``"
+  end
+  return "`" .. txt .. "`"
+end
+
+-- Emphasis markers are opened and closed as a stack across consecutive text runs, so adjacent runs
+-- with overlapping formatting render as nested Markdown ("**(*Rapport*)**") that parses back to the
+-- same runs, instead of colliding markers ("**(*****Rapport**").
+local MARK_ORDER = { "bold", "italic", "strike", "underline", "sup", "sub" }
 
 function M.render_inlines(inlines, opts)
   opts = opts or {}
@@ -594,15 +680,109 @@ function M.render_inlines(inlines, opts)
   local in_table = opts.in_table or false
   local format = opts.markdown_format or "markdown"
 
-  for _, item in ipairs(merged) do
-    if item.type == "text" then
-      local rendered = format_text_span(item)
-      if in_table then
-        rendered = rendered:gsub("|", "\\|"):gsub("\r?\n", "<br>")
+  local stack = {}
+  local pending_ws = ""
+  local function out(str)
+    if str ~= "" then
+      parts[#parts + 1] = str
+    end
+  end
+  local function close_from(idx)
+    for k = #stack, idx, -1 do
+      out(stack[k].close)
+      stack[k] = nil
+    end
+  end
+  local function flush_ws()
+    out(pending_ws)
+    pending_ws = ""
+  end
+  local function close_all()
+    close_from(1)
+    flush_ws()
+  end
+  local function marker(key, core)
+    -- next to a literal (escaped) asterisk, * markers would be misread; use _ instead
+    local starry = core:sub(1, 2) == "\\*" or core:sub(-1) == "*"
+    if key == "bold" then
+      if starry then
+        return "__", "__"
       end
-      parts[#parts + 1] = rendered
+      return "**", "**"
+    elseif key == "italic" then
+      local prev = parts[#parts]
+      if starry or (prev and prev:sub(-1) == "*") then
+        return "_", "_"
+      end
+      return "*", "*"
+    elseif key == "strike" then
+      return "~~", "~~"
+    elseif key == "underline" then
+      return "<u>", "</u>"
+    elseif key == "sup" then
+      return "^", "^"
+    end
+    return "~", "~"
+  end
+  local function emit_text(item)
+    local txt = item.text or ""
+    local lead, core, trail
+    if item.code then
+      lead, core, trail = "", code_span(txt), ""
+    else
+      lead, core, trail = escape_inline_text(txt):match("^(%s*)(.-)(%s*)$")
+    end
+    if in_table then
+      core = core:gsub("|", "\\|"):gsub("\r?\n", "<br>")
+      lead = lead:gsub("\r?\n", "<br>")
+      trail = trail:gsub("\r?\n", "<br>")
+    end
+    if (item.sup or item.sub) and not item.code then
+      core = core:gsub("(%s)", "\\%1")
+    end
+    if core == "" then
+      -- whitespace between runs keeps the surrounding formatting open
+      pending_ws = pending_ws .. lead .. trail
+      return
+    end
+    for idx, m in ipairs(stack) do
+      if not item[m.key] then
+        close_from(idx)
+        break
+      end
+    end
+    flush_ws()
+    out(lead)
+    local open = {}
+    for _, m in ipairs(stack) do
+      open[m.key] = true
+    end
+    for _, key in ipairs(MARK_ORDER) do
+      if item[key] and not open[key] and not (key == "sub" and item.sup) then
+        local o, c = marker(key, core)
+        out(o)
+        stack[#stack + 1] = { key = key, close = c }
+      end
+    end
+    out(core)
+    pending_ws = trail
+  end
+
+  for _, item in ipairs(merged) do
+    if item.type ~= "text" and item.type ~= "tab" and item.type ~= "footnote_ref" then
+      close_all()
+    elseif item.type == "footnote_ref" then
+      flush_ws()
+    end
+    if item.type == "text" then
+      emit_text(item)
     elseif item.type == "link" then
-      local label = M.render_inlines(item.inlines or {}, opts)
+      -- link text is underlined by the Hyperlink style; that is not emphasis of its own
+      local label_inlines = {}
+      for k, il in ipairs(item.inlines or {}) do
+        label_inlines[k] = il.underline and vim.tbl_extend("force", il, { underline = false }) or il
+      end
+      local label = M.render_inlines(label_inlines, opts)
       if label == "" then
         label = item.url or ""
       end
@@ -636,16 +816,18 @@ function M.render_inlines(inlines, opts)
     elseif item.type == "math" then
       parts[#parts + 1] = "$" .. (item.text or "") .. "$"
     elseif item.type == "linebreak" then
-      if in_table then
+      if in_table or opts.single_line then
         parts[#parts + 1] = "<br>"
       else
         parts[#parts + 1] = "\\\n"
       end
     elseif item.type == "tab" then
-      parts[#parts + 1] = "\t"
+      -- a tab is whitespace: markers must not close right after it
+      pending_ws = pending_ws .. "\t"
     end
   end
 
+  close_all()
   return table.concat(parts)
 end
 
@@ -832,6 +1014,7 @@ function M.markdown_to_ast(lines, opts)
   end
 
   while idx <= n do
+    local block_start_idx, block_count_before = idx, #doc.blocks
     local line = lines[idx]
     local fence, fence_lang = match_code_fence(line)
     local h_level, h_text = match_atx_heading(line)
@@ -1133,6 +1316,13 @@ function M.markdown_to_ast(lines, opts)
         idx = idx + 1
       end
     end
+
+    -- Record the source line range of each block (used to diff against the loaded document)
+    if opts.block_ranges then
+      for k = block_count_before + 1, #doc.blocks do
+        opts.block_ranges[k] = { block_start_idx, idx - 1 }
+      end
+    end
   end
 
   return doc
@@ -1191,6 +1381,7 @@ function M.ast_to_markdown_lines(doc, opts)
   end
 
   local list_counters = {}
+  local rendered_list_level = -1
 
   for i, block in ipairs(blocks) do
     local btype = block.type
@@ -1215,14 +1406,23 @@ function M.ast_to_markdown_lines(doc, opts)
       end
     end
 
+    local first_line = #lines + 1
+
     if btype == "heading" then
       local lvl = math.min(math.max(tonumber(block.level) or 1, 1), 6)
       local prefix = string.rep("#", lvl) .. " "
-      local text = M.render_inlines(block.inlines or {}, opts)
+      -- A heading is a single Markdown line; line breaks inside it become <br>
+      local text = M.render_inlines(block.inlines or {}, vim.tbl_extend("force", opts, { single_line = true }))
+      text = text:gsub("\n", " ")
       append_str_lines(prefix .. text)
 
     elseif btype == "paragraph" then
       local text = M.render_inlines(block.inlines or {}, opts)
+      local esc_lines = vim.split(text, "\n", { plain = true })
+      for k, l in ipairs(esc_lines) do
+        esc_lines[k] = escape_block_start(l)
+      end
+      text = table.concat(esc_lines, "\n")
       if wrap_mode == "auto" then
         for _, subline in ipairs(vim.split(text, "\n", { plain = true })) do
           for _, wl in ipairs(wrap_text_line(subline, 72)) do
@@ -1235,6 +1435,10 @@ function M.ast_to_markdown_lines(doc, opts)
 
     elseif btype == "list_item" then
       local lvl = math.min(math.max(tonumber(block.level) or 0, 0), 8)
+      -- Markdown nesting can only go one level deeper per item (Word lists may skip levels)
+      local prev_lvl = (prev_type == "list_item") and rendered_list_level or -1
+      lvl = math.min(lvl, prev_lvl + 1)
+      rendered_list_level = lvl
       -- Clear deeper counters
       for k, _ in pairs(list_counters) do
         if k > lvl then list_counters[k] = nil end
@@ -1318,6 +1522,10 @@ function M.ast_to_markdown_lines(doc, opts)
         lines[#lines + 1] = "| " .. table.concat(row_cells, " | ") .. " |"
       end
     end
+
+    if opts.block_ranges then
+      opts.block_ranges[i] = { first_line, #lines }
+    end
   end
 
   if doc and doc.footnotes and #doc.footnotes > 0 then
@@ -1325,7 +1533,8 @@ function M.ast_to_markdown_lines(doc, opts)
       lines[#lines + 1] = ""
     end
     for _, fn in ipairs(doc.footnotes) do
-      local fn_text = M.render_inlines(fn.inlines or {}, opts)
+      local fn_text = M.render_inlines(fn.inlines or {}, vim.tbl_extend("force", opts, { single_line = true }))
+      fn_text = fn_text:gsub("\n", " ")
       lines[#lines + 1] = string.format("[^%s]: %s", tostring(fn.id), fn_text)
     end
   end

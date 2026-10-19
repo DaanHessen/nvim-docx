@@ -365,20 +365,72 @@ function M.find_children(node, tag_or_local)
   return res
 end
 
+-- Pre-order walk over element descendants with an explicit stack (documents can nest tables
+-- thousands of levels deep, which overflows the Lua stack when recursing). Returning true from fn
+-- stops the walk.
+function M.walk(node, fn)
+  local stack = { { node, 1 } }
+  while #stack > 0 do
+    local top = stack[#stack]
+    local children = top[1].children
+    local idx = top[2]
+    if not children or idx > #children then
+      stack[#stack] = nil
+    else
+      top[2] = idx + 1
+      local child = children[idx]
+      if child.tag then
+        if fn(child) then
+          return true
+        end
+        stack[#stack + 1] = { child, 1 }
+      end
+    end
+  end
+  return false
+end
+
 function M.find_all(node, tag_or_local, acc)
   acc = acc or {}
   if not node or not node.children then
     return acc
   end
-  for _, child in ipairs(node.children) do
-    if child.tag then
-      if M.matches(child, tag_or_local) then
-        acc[#acc + 1] = child
+  M.walk(node, function(child)
+    if M.matches(child, tag_or_local) then
+      acc[#acc + 1] = child
+    end
+  end)
+  return acc
+end
+
+-- Deep copy of an element tree without recursion
+function M.clone(node)
+  local function shallow(n)
+    if n.text ~= nil then
+      return { text = n.text }
+    end
+    local attrs, order = {}, {}
+    for k, v in pairs(n.attrs or {}) do
+      attrs[k] = v
+    end
+    for i, k in ipairs(n.attr_order or {}) do
+      order[i] = k
+    end
+    return { tag = n.tag, local_name = n.local_name, attrs = attrs, attr_order = order, children = {} }
+  end
+  local root = shallow(node)
+  local stack = { { node, root } }
+  while #stack > 0 do
+    local pair = table.remove(stack)
+    for _, c in ipairs(pair[1].children or {}) do
+      local copy = shallow(c)
+      pair[2].children[#pair[2].children + 1] = copy
+      if c.children then
+        stack[#stack + 1] = { c, copy }
       end
-      M.find_all(child, tag_or_local, acc)
     end
   end
-  return acc
+  return root
 end
 
 function M.get_direct_text(node)
@@ -413,15 +465,7 @@ function M.get_all_text(node, acc)
   return table.concat(acc)
 end
 
-local function serialize_node(node, out)
-  if node.text ~= nil then
-    out[#out + 1] = M.escape_text(node.text)
-    return
-  end
-  if not node.tag then
-    return
-  end
-
+local function serialize_open_tag(node, out)
   out[#out + 1] = "<"
   out[#out + 1] = node.tag
 
@@ -456,20 +500,40 @@ local function serialize_node(node, out)
       end
     end
   end
+end
 
-  local children = node.children
-  if not children or #children == 0 then
-    out[#out + 1] = "/>"
-    return
+-- Iterative serializer (see M.walk for why recursion is avoided)
+local function serialize_node(root, out)
+  local stack = { { root, 0 } }
+  while #stack > 0 do
+    local top = stack[#stack]
+    local node, idx = top[1], top[2]
+    if idx == 0 then
+      if node.text ~= nil then
+        out[#out + 1] = M.escape_text(node.text)
+        stack[#stack] = nil
+      elseif not node.tag then
+        stack[#stack] = nil
+      else
+        serialize_open_tag(node, out)
+        if not node.children or #node.children == 0 then
+          out[#out + 1] = "/>"
+          stack[#stack] = nil
+        else
+          out[#out + 1] = ">"
+          top[2] = 1
+        end
+      end
+    elseif idx > #node.children then
+      out[#out + 1] = "</"
+      out[#out + 1] = node.tag
+      out[#out + 1] = ">"
+      stack[#stack] = nil
+    else
+      top[2] = idx + 1
+      stack[#stack + 1] = { node.children[idx], 0 }
+    end
   end
-
-  out[#out + 1] = ">"
-  for _, child in ipairs(children) do
-    serialize_node(child, out)
-  end
-  out[#out + 1] = "</"
-  out[#out + 1] = node.tag
-  out[#out + 1] = ">"
 end
 
 function M.serialize(root, opts)

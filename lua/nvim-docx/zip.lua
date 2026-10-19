@@ -52,6 +52,8 @@ else
   end
 end
 
+local is_lazy_entry, materialize
+
 local function to_u32(n)
   if n < 0 then
     return n + 4294967296
@@ -582,6 +584,37 @@ local SIG_LOCAL_FILE = 0x04034B50
 local SIG_CENTRAL_DIR = 0x02014B50
 local SIG_EOCD = 0x06054B50
 
+local LAZY_MIN_SIZE = 64 * 1024
+
+is_lazy_entry = function(name, uncomp_size)
+  local lower = name:lower()
+  if lower:match("%.xml$") or lower:match("%.rels$") then
+    return false
+  end
+  return uncomp_size >= LAZY_MIN_SIZE
+end
+
+materialize = function(entry)
+  local content
+  if entry.method == 0 then
+    content = entry.raw_data
+  else
+    local ok, inflated = pcall(M.inflate, entry.raw_data)
+    if not ok then
+      return nil, "Failed to decompress '" .. tostring(entry.name) .. "': " .. tostring(inflated)
+    end
+    content = inflated
+  end
+  if #content ~= entry.uncomp_size then
+    return nil, string.format("Size mismatch after decompression for '%s'", entry.name)
+  end
+  if M.crc32(content) ~= entry.crc then
+    return nil, string.format("CRC-32 mismatch for '%s'", entry.name)
+  end
+  entry.data = content
+  return content
+end
+
 function M.read_zip_bytes(bytes)
   if not bytes or #bytes < 22 then
     return nil, "Invalid or truncated ZIP archive (too small)"
@@ -715,7 +748,27 @@ function M.read_zip_bytes(bytes)
 
     local raw_data = string.sub(bytes, data_start, data_end)
     local content = ""
-    if name:sub(-1) ~= "/" then
+    if name:sub(-1) ~= "/" and is_lazy_entry(name, uncomp_size) then
+      -- Large binary parts (media, embedded objects, fonts) are only inflated when something reads them;
+      -- untouched ones are written back from their compressed bytes on save
+      if method ~= 0 and method ~= 8 then
+        return nil, string.format("Unsupported ZIP compression method %d for '%s'", method, name)
+      end
+      order[#order + 1] = name
+      local entry_info = {
+        name = name,
+        raw_data = raw_data,
+        method = method,
+        flags = flags,
+        dos_time = dos_time,
+        dos_date = dos_date,
+        crc = crc,
+        uncomp_size = uncomp_size,
+        lazy = true,
+      }
+      entries[#entries + 1] = entry_info
+      raw_entries[name] = entry_info
+    elseif name:sub(-1) ~= "/" then
       if method == 0 then
         content = raw_data
       elseif method == 8 then
@@ -754,12 +807,54 @@ function M.read_zip_bytes(bytes)
     end
   end
 
+  setmetatable(files, {
+    __index = function(t, name)
+      local entry = raw_entries[name]
+      if not entry or not entry.lazy then
+        return nil
+      end
+      local content, err = materialize(entry)
+      if not content then
+        error(err)
+      end
+      rawset(t, name, content)
+      return content
+    end,
+  })
+
   return {
     files = files,
     order = order,
     entries = entries,
     raw_entries = raw_entries,
   }
+end
+
+-- Inflate a lazy entry (from raw_entries or an archive's passthrough table)
+function M.materialize(entry)
+  if entry.data then
+    return entry.data
+  end
+  return materialize(entry)
+end
+
+-- All entry names, including lazy entries that pairs(archive.files) does not list yet
+function M.names(archive)
+  return archive.order or {}
+end
+
+-- True when the entry exists but has not been inflated (it can be copied as-is)
+function M.is_unread(archive, name)
+  if rawget(archive.files, name) ~= nil then
+    return false
+  end
+  local entry = (archive.passthrough and archive.passthrough[name]) or (archive.raw_entries and archive.raw_entries[name])
+  return entry ~= nil and entry.lazy == true
+end
+
+-- The raw entry behind an unread name (see M.is_unread)
+function M.unread_entry(archive, name)
+  return (archive.passthrough and archive.passthrough[name]) or (archive.raw_entries and archive.raw_entries[name])
 end
 
 function M.read_zip(filepath)
@@ -806,10 +901,11 @@ function M.write_zip_bytes(archive)
   local raw_entries = archive.raw_entries
 
   -- Collect all filenames deterministically
+  local passthrough = archive.passthrough or {}
   local seen = {}
   local final_order = {}
   for _, name in ipairs(order) do
-    if files[name] ~= nil and not seen[name] then
+    if (rawget(files, name) ~= nil or passthrough[name]) and not seen[name] then
       seen[name] = true
       final_order[#final_order + 1] = name
     end
@@ -835,13 +931,18 @@ function M.write_zip_bytes(archive)
   local dos_date = 0x0021
 
   for _, name in ipairs(final_order) do
-    local content = files[name]
-    if content ~= nil then
+    local content = rawget(files, name)
+    local pass = content == nil and passthrough[name] or nil
+    if content ~= nil or pass then
       count = count + 1
-      local uncomp_size = #content
-      local cached = raw_entries and raw_entries[name]
+      local uncomp_size = pass and pass.uncomp_size or #content
+      local cached = pass or (raw_entries and raw_entries[name])
       local crc, method, comp_data
-      if cached and cached.data == content and cached.raw_data and (cached.method == 0 or cached.method == 8) then
+      if pass then
+        crc = pass.crc
+        method = pass.method
+        comp_data = pass.raw_data
+      elseif cached and cached.data == content and cached.raw_data and (cached.method == 0 or cached.method == 8) then
         crc = cached.crc
         method = cached.method
         comp_data = cached.raw_data

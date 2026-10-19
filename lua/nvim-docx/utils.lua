@@ -23,8 +23,17 @@ local function unique_id()
   return string.format("%x%x", os.time(), math.random(1000, 9999))
 end
 
+-- Word 2007+ (OOXML) and Word 97-2003 (binary) document extensions
+local WORD_EXTS = { docx = true, docm = true, dotx = true, dotm = true, doc = true, dot = true }
+
 function M.is_docx_file(filepath)
-  return vim.fn.fnamemodify(filepath, ":e"):lower() == "docx"
+  return WORD_EXTS[vim.fn.fnamemodify(filepath or "", ":e"):lower()] == true
+end
+
+-- Legacy binary formats can be read but not written; saves go to a .docx next to them
+function M.is_legacy_word_ext(filepath)
+  local ext = vim.fn.fnamemodify(filepath or "", ":e"):lower()
+  return ext == "doc" or ext == "dot"
 end
 
 function M.get_temp_dir()

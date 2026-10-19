@@ -172,7 +172,7 @@ add_test("open_edit_save_rich_docx", function()
 
   local arch = assert(zip.read_zip(rich_docx))
   local has_media = false
-  for name, _ in pairs(arch.files) do
+  for _, name in ipairs(zip.names(arch)) do
     if name:find("^word/media/") then
       has_media = true
       break

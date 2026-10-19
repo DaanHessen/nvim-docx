@@ -5,8 +5,11 @@
 local xml = require("nvim-docx.xml")
 local image = require("nvim-docx.image")
 local markdown = require("nvim-docx.markdown")
+local zip = require("nvim-docx.zip")
 
 local M = {}
+
+local sort_rpr_children
 
 local NS_W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 local NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -1220,6 +1223,11 @@ local function resolve_list_props(numbering, styles, num_id, ilvl, pstyle)
   return true, ordered, ilvl, start_val, abs_key, has_start_override
 end
 
+-- Map a character in a symbol font (Symbol, Wingdings, ...) to Unicode; char_hex is its code in hex
+function M.decode_symbol(font, char_hex)
+  return decode_w_sym(font, char_hex)
+end
+
 function M.docx_to_ast(archive, workspace, opts)
   opts = opts or {}
   local track_policy = opts.track_changes or "accept"
@@ -1271,7 +1279,7 @@ function M.docx_to_ast(archive, workspace, opts)
           local fname = vim.fn.fnamemodify(zip_entry_path, ":t")
           local rel_out_path = "media/" .. fname
           rel_media_map[rid] = rel_out_path
-          if workspace and workspace ~= "" and archive.files[zip_entry_path] then
+          if workspace and workspace ~= "" and rawget(archive.files, zip_entry_path) then
             write_binary_file(workspace .. "/" .. rel_out_path, archive.files[zip_entry_path])
           end
         end
@@ -1282,7 +1290,8 @@ function M.docx_to_ast(archive, workspace, opts)
   extract_rels_media(footnote_rels)
   extract_rels_media(endnote_rels)
 
-  -- Also extract any other files in word/media/* into workspace/media/*
+  -- Also extract any other files in word/media/* into workspace/media/* (large ones are left
+  -- compressed in the archive until needed; see M.extract_media)
   if workspace and workspace ~= "" then
     for name, content in pairs(archive.files) do
       local media_sub = name:match("^word/(media/.+)$") or name:match("^(media/.+)$")
@@ -1617,6 +1626,12 @@ function M.docx_to_ast(archive, workspace, opts)
               local s_node = xml.find_child(rpr, "strike") or xml.find_child(rpr, "dstrike")
               if s_node then rfmt.strike = is_bool_on(s_node) end
 
+              local u_node = xml.find_child(rpr, "u")
+              if u_node then
+                local uval = (xml.get_attr(u_node, "w:val") or "single"):lower()
+                rfmt.underline = uval ~= "none" and uval ~= "0" and uval ~= "false"
+              end
+
               local va_node = xml.find_child(rpr, "vertAlign")
               if va_node then
                 local vval = (xml.get_attr(va_node, "w:val") or ""):lower()
@@ -1907,86 +1922,7 @@ function M.docx_to_ast(archive, workspace, opts)
     return markdown.merge_inlines(inlines), found_hr, found_checkbox, only_omath_para
   end
 
-  local function trim_inlines(inlines, trim_leading_spaces)
-    if not inlines then
-      return {}
-    end
-    while #inlines > 0 do
-      local first = inlines[1]
-      if first.type == "tab" or first.type == "linebreak" then
-        table.remove(inlines, 1)
-      elseif trim_leading_spaces and first.type == "text" then
-        first.text = (first.text or ""):gsub("^[ \t]+", "")
-        if first.text == "" then
-          table.remove(inlines, 1)
-        else
-          break
-        end
-      else
-        break
-      end
-    end
-    while #inlines > 0 do
-      local last = inlines[#inlines]
-      if last.type == "tab" or last.type == "linebreak" then
-        table.remove(inlines, #inlines)
-      elseif last.type == "text" then
-        last.text = (last.text or ""):gsub("[ \t]+$", "")
-        if last.text == "" then
-          table.remove(inlines, #inlines)
-        else
-          break
-        end
-      else
-        break
-      end
-    end
-    -- Clean up spaces/tabs adjacent to interior linebreaks and collapse consecutive linebreaks
-    local i = 1
-    while i <= #inlines do
-      if inlines[i].type == "linebreak" then
-        -- Trim trailing spaces/tabs before linebreak
-        if i > 1 then
-          local prev = inlines[i - 1]
-          if prev.type == "tab" then
-            table.remove(inlines, i - 1)
-            i = i - 1
-          elseif prev.type == "text" then
-            prev.text = (prev.text or ""):gsub("[ \t]+$", "")
-            if prev.text == "" then
-              table.remove(inlines, i - 1)
-              i = i - 1
-            end
-          end
-        end
-        -- Trim leading spaces/tabs or duplicate linebreaks after linebreak
-        while i + 1 <= #inlines do
-          local nxt = inlines[i + 1]
-          if nxt.type == "linebreak" or nxt.type == "tab" then
-            table.remove(inlines, i + 1)
-          elseif nxt.type == "text" then
-            nxt.text = (nxt.text or ""):gsub("^[ \t]+", "")
-            if nxt.text == "" then
-              table.remove(inlines, i + 1)
-            else
-              break
-            end
-          else
-            break
-          end
-        end
-      end
-      i = i + 1
-    end
-    -- Re-check leading/trailing linebreak in case interior cleanup exposed one
-    while #inlines > 0 and (inlines[1].type == "linebreak" or inlines[1].type == "tab") do
-      table.remove(inlines, 1)
-    end
-    while #inlines > 0 and (inlines[#inlines].type == "linebreak" or inlines[#inlines].type == "tab") do
-      table.remove(inlines, #inlines)
-    end
-    return markdown.merge_inlines(inlines)
-  end
+  local trim_inlines = markdown.trim_inlines
 
   local function collect_paragraphs_recursive(container, out_paras)
     out_paras = out_paras or {}
@@ -2055,8 +1991,9 @@ function M.docx_to_ast(archive, workspace, opts)
 
   local ordered_counters = {}
   local seen_override_nums = {}
+  local merged_into_prev_block = false
 
-  local function process_paragraph(pnode)
+  local function process_paragraph_inner(pnode)
     local ppr = xml.find_child(pnode, "pPr")
     local pstyle = nil
     local direct_outline_lvl = nil
@@ -2105,6 +2042,7 @@ function M.docx_to_ast(archive, workspace, opts)
       local prev_block = ast.blocks[#ast.blocks]
       if prev_block and prev_block.type == "code_block" then
         prev_block.text = prev_block.text .. "\n" .. line_code
+        merged_into_prev_block = true
       else
         ast.blocks[#ast.blocks + 1] = {
           type = "code_block",
@@ -2222,6 +2160,15 @@ function M.docx_to_ast(archive, workspace, opts)
       type = "paragraph",
       inlines = inlines,
     }
+  end
+
+  -- Remember the source XML node of every block so a save can reuse it (see preserve.lua)
+  local function process_paragraph(pnode)
+    local n0 = #ast.blocks
+    process_paragraph_inner(pnode)
+    for k = n0 + 1, #ast.blocks do
+      ast.blocks[k]._pnode = pnode
+    end
   end
 
   local function process_table(tbl_node)
@@ -2350,6 +2297,7 @@ function M.docx_to_ast(archive, workspace, opts)
       alignments = alignments,
       headers = headers,
       rows = data_rows,
+      _pnode = tbl_node,
     }
   end
 
@@ -2396,7 +2344,35 @@ function M.docx_to_ast(archive, workspace, opts)
   end
 
   local body = xml.find_child(doc_root, "body") or doc_root
-  walk_body(body)
+
+  -- Walk top-level body children one by one, grouping the blocks each one produces.
+  -- Children that produce no block (empty spacing paragraphs, page/section breaks, bookmarks)
+  -- are kept as "glue" in front of the next group so a save can put them back.
+  local groups = {}
+  local glue = {}
+  for _, child in ipairs(body.children or {}) do
+    if child.tag and child.local_name ~= "sectPr" then
+      local n0 = #ast.blocks
+      merged_into_prev_block = false
+      walk_body({ children = { child } })
+      local n1 = #ast.blocks
+      if n1 > n0 then
+        local group = { first = n0 + 1, last = n1, nodes = { child }, glue = glue }
+        groups[#groups + 1] = group
+        for k = n0 + 1, n1 do
+          ast.blocks[k]._group = #groups
+        end
+        glue = {}
+      elseif merged_into_prev_block and #groups > 0 and groups[#groups].last == n1 then
+        local nodes = groups[#groups].nodes
+        nodes[#nodes + 1] = child
+      else
+        glue[#glue + 1] = child
+      end
+    end
+  end
+  ast._groups = groups
+  ast._trailing_glue = glue
 
   -- Populate referenced footnotes/endnotes/comments in appearance order
   for _, ref in ipairs(referenced_footnotes) do
@@ -2545,23 +2521,20 @@ local function ensure_required_styles(styles_xml_str)
     end
   end
 
-  -- If Normal has no paragraph spacing and TextBody does (e.g. LibreOffice templates), inherit TextBody's spacing
+  -- LibreOffice templates leave Normal without spacing and put body-text spacing on TextBody; new
+  -- paragraphs use TextBody there so they match the rest of the document. Existing styles are never
+  -- modified, since every untouched paragraph depends on them.
+  local body_style_id = nil
   local normal_node = style_nodes["Normal"]
   local textbody_node = style_nodes["TextBody"]
-  local modified = false
   if normal_node and textbody_node then
     local norm_ppr = xml.find_child(normal_node, "pPr")
     local tb_ppr = xml.find_child(textbody_node, "pPr")
-    local tb_spacing = tb_ppr and xml.find_child(tb_ppr, "spacing") or nil
-    if tb_spacing and (not norm_ppr or not xml.find_child(norm_ppr, "spacing")) then
-      if not norm_ppr then
-        norm_ppr = xml.elem("w:pPr")
-        normal_node.children[#normal_node.children + 1] = norm_ppr
-      end
-      norm_ppr.children[#norm_ppr.children + 1] = vim.deepcopy(tb_spacing)
-      modified = true
+    if tb_ppr and xml.find_child(tb_ppr, "spacing") and not (norm_ppr and xml.find_child(norm_ppr, "spacing")) then
+      body_style_id = "TextBody"
     end
   end
+  local modified = false
 
   local def_root = xml.parse(default_styles_xml())
   if def_root then
@@ -2582,9 +2555,9 @@ local function ensure_required_styles(styles_xml_str)
   end
 
   if modified then
-    return xml.serialize(root), heading_ids
+    return xml.serialize(root), heading_ids, body_style_id
   end
-  return styles_xml_str, heading_ids
+  return styles_xml_str, heading_ids, body_style_id
 end
 
 local function build_numbering_xml(list_defs, existing_numbering_xml)
@@ -2740,6 +2713,163 @@ local function build_chart_drawing_element(r_id, chart_id, name, cx, cy)
   })
 end
 
+-- Schema order of <w:rPr> children (CT_RPr); Word rejects runs whose properties are out of order
+local RPR_ORDER = {}
+for idx, name in ipairs({
+  "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps", "strike", "dstrike", "outline", "shadow",
+  "emboss", "imprint", "noProof", "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+  "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd", "fitText", "vertAlign", "rtl", "cs",
+  "em", "lang", "eastAsianLayout", "specVanish", "oMath",
+}) do
+  RPR_ORDER[name] = idx
+end
+
+sort_rpr_children = function(children)
+  local indexed = {}
+  for pos, c in ipairs(children) do
+    indexed[pos] = { node = c, pos = pos, rank = RPR_ORDER[c.local_name] or 1000 }
+  end
+  table.sort(indexed, function(x, y)
+    if x.rank ~= y.rank then
+      return x.rank < y.rank
+    end
+    return x.pos < y.pos
+  end)
+  for pos, e in ipairs(indexed) do
+    children[pos] = e.node
+  end
+end
+
+-- Properties Markdown expresses itself; an edited block takes them from the Markdown, not the original run
+local MARKDOWN_RPR = {
+  b = true, bCs = true, i = true, iCs = true, strike = true, dstrike = true, u = true, vertAlign = true,
+  rPrChange = true,
+}
+local MARKDOWN_RSTYLES = { Hyperlink = true, VerbatimChar = true, FootnoteReference = true }
+
+-- rPr of the first text run of an original paragraph, minus what Markdown controls
+local function inheritable_run_props(pnode)
+  if not pnode then
+    return nil
+  end
+  local found = nil
+  local function walk(node)
+    for _, c in ipairs(node.children or {}) do
+      if found then
+        return
+      end
+      if c.local_name == "r" then
+        if xml.find_child(c, "t") then
+          found = xml.find_child(c, "rPr") or false
+          return
+        end
+      elseif c.local_name == "hyperlink" or c.local_name == "ins" or c.local_name == "smartTag"
+        or c.local_name == "customXml" or c.local_name == "sdt" or c.local_name == "sdtContent"
+        or c.local_name == "fldSimple" then
+        walk(c)
+      end
+    end
+  end
+  walk(pnode)
+  if not found then
+    return nil
+  end
+  local out = {}
+  for _, c in ipairs(found.children or {}) do
+    if c.tag and not MARKDOWN_RPR[c.local_name] then
+      local style = c.local_name == "rStyle" and xml.get_attr(c, "w:val") or nil
+      if not (style and MARKDOWN_RSTYLES[style]) then
+        out[#out + 1] = c
+      end
+    end
+  end
+  return #out > 0 and out or nil
+end
+
+local function inheritable_para_props(pnode)
+  local ppr = pnode and pnode.local_name == "p" and xml.find_child(pnode, "pPr") or nil
+  if not ppr then
+    return nil
+  end
+  local copy = xml.clone(ppr)
+  -- Paragraph-mark revision marks belong to the old text
+  for k = #copy.children, 1, -1 do
+    local c = copy.children[k]
+    if c.local_name == "pPrChange" then
+      table.remove(copy.children, k)
+    end
+  end
+  return copy
+end
+
+-- Relationship ids (r:id, r:embed, r:link, r:dm, ...) referenced anywhere inside a node
+local function collect_rel_ids(node, acc)
+  local function scan(n)
+    for k, v in pairs(n.attrs or {}) do
+      if k:sub(1, 2) == "r:" then
+        acc[v] = true
+      end
+    end
+  end
+  if node.tag then
+    scan(node)
+  end
+  xml.walk(node, scan)
+  return acc
+end
+
+local NOTE_REFS = { footnoteReference = true, endnoteReference = true, commentReference = true }
+
+local function node_has_note_refs(node)
+  return xml.walk(node, function(c)
+    return NOTE_REFS[c.local_name] == true
+  end)
+end
+
+local function inlines_have_note_refs(inlines)
+  for _, it in ipairs(inlines or {}) do
+    if it.type == "footnote_ref" then
+      return true
+    end
+    if it.inlines and inlines_have_note_refs(it.inlines) then
+      return true
+    end
+  end
+  return false
+end
+
+local function block_has_note_refs(block)
+  if inlines_have_note_refs(block.inlines) then
+    return true
+  end
+  for _, cell in ipairs(block.headers or {}) do
+    if inlines_have_note_refs(cell) then
+      return true
+    end
+  end
+  for _, row in ipairs(block.rows or {}) do
+    for _, cell in ipairs(row) do
+      if inlines_have_note_refs(cell) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function max_numeric_attr(root, local_name, attr)
+  local max_v = 0
+  if root then
+    for _, n in ipairs(xml.find_all(root, local_name)) do
+      local v = tonumber(xml.get_attr(n, attr))
+      if v and v > max_v then
+        max_v = v
+      end
+    end
+  end
+  return max_v
+end
+
 function M.ast_to_docx(doc, workspace, reference_archive, opts)
   opts = opts or {}
   local preserve = (opts.preserve_styles ~= false) and (reference_archive ~= nil)
@@ -2747,33 +2877,67 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   local archive = {
     files = {},
     order = {},
+    -- Entries copied from the reference archive without being inflated (written back compressed)
+    passthrough = {},
   }
+  setmetatable(archive.files, {
+    __index = function(t, name)
+      local entry = archive.passthrough[name]
+      if entry then
+        local content = zip.materialize(entry)
+        rawset(t, name, content)
+        return content
+      end
+    end,
+  })
+
+  -- Copy one entry of the reference archive, without inflating it if nothing has read it yet
+  local function copy_entry(name)
+    if zip.is_unread(reference_archive, name) then
+      archive.passthrough[name] = zip.unread_entry(reference_archive, name)
+    else
+      archive.files[name] = reference_archive.files[name]
+    end
+  end
 
   local preserved_sect_pr = nil
   local preserved_doc_attrs = nil
+  local orig_doc_root = nil
+  local preserved_doc_siblings = {}
+  local orig_rels_by_id = {}
   local kept_rels = {}
   local max_rid_num = 0
   local header_footer_media = {}
 
   if preserve and reference_archive and reference_archive.files then
     archive.raw_entries = reference_archive.raw_entries
-    for k, v in pairs(reference_archive.files) do
+    local copied = {}
+    local function copy_named(k)
       -- Copy all files except body-specific media that we will re-populate or retain
-      if not k:match("^word/media/") then
-        archive.files[k] = v
+      if not copied[k] and not k:match("^word/media/") then
+        copied[k] = true
+        copy_entry(k)
+        archive.order[#archive.order + 1] = k
       end
     end
-    for _, name in ipairs(reference_archive.order or {}) do
-      if archive.files[name] ~= nil then
-        archive.order[#archive.order + 1] = name
-      end
+    for _, name in ipairs(zip.names(reference_archive)) do
+      copy_named(name)
+    end
+    for k, _ in pairs(reference_archive.files) do
+      copy_named(k)
     end
 
     -- Inspect original word/document.xml for root attributes and <w:sectPr>
     if reference_archive.files["word/document.xml"] then
       local orig_doc = xml.parse(reference_archive.files["word/document.xml"])
+      orig_doc_root = orig_doc
       if orig_doc then
         preserved_doc_attrs = vim.deepcopy(orig_doc.attrs or {})
+        for _, c in ipairs(orig_doc.children or {}) do
+          if c.tag and c.local_name ~= "body" then
+            preserved_doc_siblings[#preserved_doc_siblings + 1] = c
+          end
+        end
         local orig_body = xml.find_child(orig_doc, "body")
         if orig_body then
           local sect = xml.find_child(orig_body, "sectPr")
@@ -2791,7 +2955,10 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         for _, hr in pairs(hrels) do
           if hr.target and hr.target ~= "" then
             local mpath = normalize_zip_path("word", hr.target)
-            if reference_archive.files[mpath] then
+            if zip.is_unread(reference_archive, mpath) then
+              archive.passthrough[mpath] = zip.unread_entry(reference_archive, mpath)
+              archive.order[#archive.order + 1] = mpath
+            elseif rawget(reference_archive.files, mpath) then
               header_footer_media[mpath] = reference_archive.files[mpath]
             end
           end
@@ -2806,6 +2973,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
     -- Parse existing word/_rels/document.xml.rels
     local orig_rels = parse_relationships(reference_archive, "word/_rels/document.xml.rels")
     for _, rel in pairs(orig_rels) do
+      orig_rels_by_id[rel.id] = rel
       local rnum = tonumber((rel.id or ""):match("^rId(%d+)$"))
       if rnum and rnum > max_rid_num then
         max_rid_num = rnum
@@ -2838,7 +3006,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   end
 
   -- Ensure styles.xml exists and has required styles
-  local styles_xml, heading_style_ids = ensure_required_styles(archive.files["word/styles.xml"])
+  local styles_xml, heading_style_ids, body_style_id = ensure_required_styles(archive.files["word/styles.xml"])
   archive.files["word/styles.xml"] = styles_xml
   add_rel(REL_STYLES, "styles.xml")
 
@@ -2926,6 +3094,30 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   local compiled_footnotes = {}
   local fn_id_to_num = {}
 
+  -- Run formatting inherited from the original paragraph an edited block replaces (font, size, color...)
+  local base_rpr_children = nil
+
+  local function merge_base_rpr(rpr_children)
+    if not base_rpr_children then
+      return rpr_children
+    end
+    local by_name = {}
+    for _, c in ipairs(rpr_children) do
+      by_name[c.local_name] = true
+    end
+    local merged = {}
+    for _, c in ipairs(base_rpr_children) do
+      if not by_name[c.local_name] then
+        merged[#merged + 1] = vim.deepcopy(c)
+      end
+    end
+    for _, c in ipairs(rpr_children) do
+      merged[#merged + 1] = c
+    end
+    sort_rpr_children(merged)
+    return merged
+  end
+
   -- Convert AST inlines to WordprocessingML child elements (<w:r>, <w:hyperlink>, etc.)
   local function compile_inlines(inlines, extra_rpr)
     local elements = {}
@@ -2961,6 +3153,10 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
           rpr_children[#rpr_children + 1] = xml.elem("w:vertAlign", { ["w:val"] = "superscript" })
         elseif item.sub then
           rpr_children[#rpr_children + 1] = xml.elem("w:vertAlign", { ["w:val"] = "subscript" })
+        end
+
+        if not item.code then
+          rpr_children = merge_base_rpr(rpr_children)
         end
 
         local run_children = {}
@@ -3074,8 +3270,188 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   local active_ordered_num_id = nil
   local bookmark_counter = 0
 
-  for i, block in ipairs((doc and doc.blocks) or {}) do
+  -- Reuse the original XML of blocks the user did not edit (mapping computed by preserve.lua)
+  local psrc = preserve and opts.preserve_source or nil
+  local pmap = (psrc and opts.preserve_map) or { exact = {}, inherit = {} }
+  local orig_blocks = psrc and psrc.ast.blocks or {}
+  local groups = psrc and psrc.ast._groups or {}
+  local verbatim_group = {}
+  local notes_rebuilt = false
+  local reused_nodes = {}
+  local glue_emitted = 0
+
+  if psrc then
+    -- Keep new bookmark and drawing ids clear of the ones in reused paragraphs
+    bookmark_counter = max_numeric_attr(orig_doc_root, "bookmarkStart", "w:id")
+    pic_counter = max_numeric_attr(orig_doc_root, "docPr", "id")
+
+    local new_of_orig = {}
+    for j, oi in pairs(pmap.exact) do
+      new_of_orig[oi] = j
+    end
+    local candidate = {}
+    for g, grp in ipairs(groups) do
+      local j0 = new_of_orig[grp.first]
+      local ok = j0 ~= nil
+      for k = grp.first, grp.last do
+        if not ok or new_of_orig[k] ~= j0 + (k - grp.first) then
+          ok = false
+          break
+        end
+      end
+      candidate[g] = ok
+    end
+
+    -- footnotes.xml is rebuilt (and renumbered) as soon as any regenerated block references a note or a
+    -- note's text changed; reused paragraphs pointing at the old note ids must then be regenerated too
+    local new_notes = doc.footnotes or {}
+    local old_notes = psrc.ast.footnotes or {}
+    if #new_notes ~= #old_notes then
+      notes_rebuilt = true
+    else
+      for k, fn in ipairs(new_notes) do
+        local old = old_notes[k]
+        if tostring(fn.id) ~= tostring(old.id)
+          or markdown.render_inlines(fn.inlines or {}) ~= markdown.render_inlines(old.inlines or {}) then
+          notes_rebuilt = true
+          break
+        end
+      end
+    end
+    for j, block in ipairs(doc.blocks or {}) do
+      local oi = pmap.exact[j]
+      local g = oi and orig_blocks[oi]._group
+      if not (g and candidate[g]) and block_has_note_refs(block) then
+        notes_rebuilt = true
+      end
+    end
+    for g, grp in ipairs(groups) do
+      if candidate[g] then
+        local has_notes = false
+        for _, n in ipairs(grp.nodes) do
+          if node_has_note_refs(n) then
+            has_notes = true
+          end
+        end
+        verbatim_group[g] = not (has_notes and notes_rebuilt)
+      end
+    end
+  end
+
+  -- Empty paragraphs, page and section breaks that sat in front of original groups
+  local function emit_glue_through(g)
+    while glue_emitted < math.min(g, #groups) do
+      glue_emitted = glue_emitted + 1
+      for _, n in ipairs(groups[glue_emitted].glue) do
+        body_children[#body_children + 1] = n
+        reused_nodes[#reused_nodes + 1] = n
+      end
+    end
+  end
+
+  -- Rewrite one table cell with new content, keeping its cell, paragraph and run properties
+  local function rewrite_cell(tc, inlines)
+    local first_p = xml.find_child(tc, "p")
+    local ppr = inheritable_para_props(first_p)
+    local saved_base = base_rpr_children
+    base_rpr_children = inheritable_run_props(first_p)
+    local p_children = compile_inlines(inlines)
+    base_rpr_children = saved_base
+    if ppr then
+      table.insert(p_children, 1, ppr)
+    end
+    local kept = {}
+    for _, c in ipairs(tc.children) do
+      if c.tag and c.local_name == "tcPr" then
+        kept[#kept + 1] = c
+      end
+    end
+    kept[#kept + 1] = xml.elem("w:p", nil, p_children)
+    tc.children = kept
+  end
+
+  -- An edited table with the same shape as the original: copy the original table and rewrite only the
+  -- cells whose content changed. Returns nil when the shapes differ.
+  local function patch_table(src, block)
+    local tbl = src._pnode
+    for _, c in ipairs(tbl.children or {}) do
+      local ln = c.local_name
+      if c.tag and ln ~= "tr" and ln ~= "tblPr" and ln ~= "tblGrid" and ln ~= "bookmarkStart" and ln ~= "bookmarkEnd" then
+        return nil
+      end
+    end
+    local new_rows = { block.headers or {} }
+    for _, r in ipairs(block.rows or {}) do
+      new_rows[#new_rows + 1] = r
+    end
+    local old_rows = { src.headers or {} }
+    for _, r in ipairs(src.rows or {}) do
+      old_rows[#old_rows + 1] = r
+    end
+    local copy = xml.clone(tbl)
+    local trs = xml.find_children(copy, "tr")
+    if #trs ~= #new_rows or #trs ~= #old_rows then
+      return nil
+    end
+    local cell_opts = { in_table = true }
+    local rewrites = {}
+    for r, tr in ipairs(trs) do
+      local col = 0
+      for _, tc in ipairs(tr.children or {}) do
+        if tc.tag and tc.local_name ~= "trPr" and tc.local_name ~= "tblPrEx" then
+          if tc.local_name ~= "tc" then
+            return nil
+          end
+          col = col + 1
+          local first = col
+          local tcpr = xml.find_child(tc, "tcPr")
+          local gs = tcpr and xml.find_child(tcpr, "gridSpan")
+          col = col + math.max(tonumber(gs and xml.get_attr(gs, "w:val")) or 1, 1) - 1
+          for c = first, col do
+            local new_md = markdown.render_inlines(new_rows[r][c] or {}, cell_opts)
+            if new_md ~= markdown.render_inlines(old_rows[r][c] or {}, cell_opts) then
+              if c ~= first then
+                return nil
+              end
+              rewrites[#rewrites + 1] = { tc = tc, inlines = new_rows[r][c] or {} }
+            end
+          end
+        end
+      end
+      if col ~= #old_rows[r] or #new_rows[r] > col then
+        return nil
+      end
+    end
+    for _, rw in ipairs(rewrites) do
+      rewrite_cell(rw.tc, rw.inlines)
+    end
+    return copy
+  end
+
+  local function set_pstyle(ppr, style_id)
+    local ps = xml.find_child(ppr, "pStyle")
+    if ps then
+      xml.set_attr(ps, "w:val", style_id)
+    else
+      table.insert(ppr.children, 1, xml.elem("w:pStyle", { ["w:val"] = style_id }))
+    end
+  end
+
+  -- Generate one block; `src` is the original block it replaces (if any), whose paragraph and run
+  -- formatting carries over so an edited paragraph keeps its font, size, color, spacing and alignment
+  local function generate_block(i, block, src)
     local btype = block.type
+    local src_pnode = src and src.type == btype and src._pnode or nil
+
+    -- (a patched table keeps its original note references, which are only valid if notes are kept)
+    if btype == "table" and src_pnode and not (notes_rebuilt and node_has_note_refs(src_pnode)) then
+      local patched = patch_table(src, block)
+      if patched then
+        body_children[#body_children + 1] = patched
+        reused_nodes[#reused_nodes + 1] = patched
+        return
+      end
+    end
     local prev_block = doc.blocks[i - 1]
 
     if btype ~= "list_item" then
@@ -3092,10 +3468,18 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
       if slug == "" then
         slug = "heading-" .. bm_id
       end
-      local p_children = {
-        xml.elem("w:pPr", nil, {
+      local ppr = inheritable_para_props(src_pnode)
+      if ppr then
+        if (tonumber(src.level) or 1) ~= lvl then
+          set_pstyle(ppr, style_id)
+        end
+      else
+        ppr = xml.elem("w:pPr", nil, {
           xml.elem("w:pStyle", { ["w:val"] = style_id }),
-        }),
+        })
+      end
+      local p_children = {
+        ppr,
         xml.elem("w:bookmarkStart", { ["w:id"] = bm_id, ["w:name"] = slug }),
       }
       for _, el in ipairs(compile_inlines(block.inlines)) do
@@ -3106,6 +3490,13 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
 
     elseif btype == "paragraph" then
       local p_children = compile_inlines(block.inlines)
+      local ppr = inheritable_para_props(src_pnode)
+      if not ppr and body_style_id then
+        ppr = xml.elem("w:pPr", nil, { xml.elem("w:pStyle", { ["w:val"] = body_style_id }) })
+      end
+      if ppr then
+        table.insert(p_children, 1, ppr)
+      end
       body_children[#body_children + 1] = xml.elem("w:p", nil, p_children)
 
     elseif btype == "math_block" then
@@ -3117,8 +3508,19 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
 
     elseif btype == "list_item" then
       local lvl = math.min(math.max(tonumber(block.level) or 0, 0), 8)
+      local inherited_ppr = nil
+      if src_pnode and (src.ordered or false) == (block.ordered or false) then
+        inherited_ppr = inheritable_para_props(src_pnode)
+        local num_pr = inherited_ppr and xml.find_child(inherited_ppr, "numPr")
+        local ilvl = num_pr and xml.find_child(num_pr, "ilvl")
+        if ilvl then
+          xml.set_attr(ilvl, "w:val", tostring(lvl))
+        end
+      end
       local num_id
-      if block.ordered then
+      if inherited_ppr then
+        num_id = nil
+      elseif block.ordered then
         if not active_ordered_num_id or (prev_block and prev_block.type == "list_item" and not prev_block.ordered and (prev_block.level or 0) <= lvl) then
           local new_id = list_id_offset + #list_defs + 1
           list_defs[#list_defs + 1] = {
@@ -3152,7 +3554,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
       end
 
       local p_children = {
-        xml.elem("w:pPr", nil, {
+        inherited_ppr or xml.elem("w:pPr", nil, {
           xml.elem("w:pStyle", { ["w:val"] = "Compact" }),
           xml.elem("w:numPr", nil, {
             xml.elem("w:ilvl", { ["w:val"] = tostring(lvl) }),
@@ -3169,7 +3571,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
       local bq_lvl = math.max(tonumber(block.level) or 1, 1)
       local left_ind = tostring(720 * bq_lvl)
       local p_children = {
-        xml.elem("w:pPr", nil, {
+        inheritable_para_props(src_pnode) or xml.elem("w:pPr", nil, {
           xml.elem("w:pStyle", { ["w:val"] = "BlockText" }),
           xml.elem("w:pBdr", nil, {
             xml.elem("w:left", { ["w:val"] = "single", ["w:sz"] = "12", ["w:space"] = "12", ["w:color"] = "D0D7DE" }),
@@ -3225,8 +3627,9 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         grid_cols[#grid_cols + 1] = xml.elem("w:gridCol", { ["w:w"] = col_w })
       end
 
+      local src_tblpr = src_pnode and xml.find_child(src_pnode, "tblPr")
       local tbl_children = {
-        xml.elem("w:tblPr", nil, {
+        src_tblpr and vim.deepcopy(src_tblpr) or xml.elem("w:tblPr", nil, {
           xml.elem("w:tblStyle", { ["w:val"] = "TableGrid" }),
           xml.elem("w:tblW", { ["w:w"] = "0", ["w:type"] = "auto" }),
           xml.elem("w:tblBorders", nil, {
@@ -3286,6 +3689,80 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
       end
 
       body_children[#body_children + 1] = xml.elem("w:tbl", nil, tbl_children)
+    end
+  end
+
+  for i, block in ipairs((doc and doc.blocks) or {}) do
+    local oi = pmap.exact[i]
+    local og = oi and orig_blocks[oi]._group
+    if og and verbatim_group[og] then
+      if oi == groups[og].first then
+        emit_glue_through(og)
+        for _, n in ipairs(groups[og].nodes) do
+          body_children[#body_children + 1] = n
+          reused_nodes[#reused_nodes + 1] = n
+        end
+      end
+      active_ordered_num_id = nil
+    else
+      local src_i = oi or pmap.inherit[i]
+      local src = src_i and orig_blocks[src_i] or nil
+      if src and src._group then
+        emit_glue_through(src._group)
+      end
+      local style_i = not src and pmap.style_from and pmap.style_from[i] or nil
+      if style_i then
+        -- Look only: a copy without the neighbour's section break
+        src = vim.tbl_extend("force", {}, orig_blocks[style_i])
+        src._pnode = src._pnode and xml.clone(src._pnode)
+        local ppr = src._pnode and xml.find_child(src._pnode, "pPr")
+        if ppr then
+          for k = #ppr.children, 1, -1 do
+            if ppr.children[k].local_name == "sectPr" then
+              table.remove(ppr.children, k)
+            end
+          end
+        end
+      end
+      base_rpr_children = src and src.type == block.type and inheritable_run_props(src._pnode) or nil
+      generate_block(i, block, src)
+      base_rpr_children = nil
+    end
+  end
+  if psrc then
+    emit_glue_through(#groups)
+    for _, n in ipairs(psrc.ast._trailing_glue or {}) do
+      body_children[#body_children + 1] = n
+      reused_nodes[#reused_nodes + 1] = n
+    end
+
+    -- Relationships (images, links, charts, embedded objects) used by reused XML keep their original ids
+    local rids = {}
+    for _, n in ipairs(reused_nodes) do
+      collect_rel_ids(n, rids)
+    end
+    local have = {}
+    for _, r in ipairs(kept_rels) do
+      have[r.id] = true
+    end
+    for rid in pairs(rids) do
+      local rel = orig_rels_by_id[rid]
+      if rel and not have[rid] then
+        have[rid] = true
+        kept_rels[#kept_rels + 1] = rel
+        if rel.type == REL_IMAGE and rel.target_mode ~= "External" then
+          local mpath = normalize_zip_path("word", rel.target)
+          local present = rawget(archive.files, mpath) ~= nil or archive.passthrough[mpath] ~= nil
+          if not present and (zip.is_unread(reference_archive, mpath) or reference_archive.files[mpath]) then
+            copy_entry(mpath)
+            archive.order[#archive.order + 1] = mpath
+            local ext = (mpath:match("%.(%w+)$") or ""):lower()
+            if ext ~= "" then
+              media_exts[ext] = image.content_type_for_ext(ext)
+            end
+          end
+        end
+      end
     end
   end
 
@@ -3394,9 +3871,12 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   doc_attrs["xmlns:o"] = NS_O
   doc_attrs["xmlns:m"] = NS_M
 
-  local doc_elem = xml.elem("w:document", doc_attrs, {
-    xml.elem("w:body", nil, body_children),
-  })
+  local doc_children = {}
+  for _, c in ipairs(preserved_doc_siblings) do
+    doc_children[#doc_children + 1] = c
+  end
+  doc_children[#doc_children + 1] = xml.elem("w:body", nil, body_children)
+  local doc_elem = xml.elem("w:document", doc_attrs, doc_children)
   archive.files["word/document.xml"] = xml.serialize(doc_elem)
 
   -- Build word/_rels/document.xml.rels
@@ -3552,6 +4032,19 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
   return archive
 end
 
+-- Write every word/media/* entry to workspace/media/ (inflating entries skipped at load time)
+function M.extract_media(archive, workspace)
+  for _, name in ipairs(zip.names(archive)) do
+    local media_sub = name:match("^word/(media/.+)$")
+    if media_sub and vim.fn.filereadable(workspace .. "/" .. media_sub) == 0 then
+      local content = archive.files[name]
+      if content then
+        write_binary_file(workspace .. "/" .. media_sub, content)
+      end
+    end
+  end
+end
+
 function M.get_docx_stats(archive, ast)
   ast = ast or M.docx_to_ast(archive)
   local stats = {
@@ -3570,7 +4063,7 @@ function M.get_docx_stats(archive, ast)
   }
 
   if archive and archive.files then
-    for name, _ in pairs(archive.files) do
+    for _, name in ipairs(zip.names(archive)) do
       stats.archive_files = stats.archive_files + 1
       if name:match("^word/media/") then
         stats.images = stats.images + 1

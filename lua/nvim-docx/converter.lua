@@ -2,7 +2,9 @@ local utils = require("nvim-docx.utils")
 local config = require("nvim-docx.config")
 local zip = require("nvim-docx.zip")
 local ooxml = require("nvim-docx.ooxml")
+local doc_ole = require("nvim-docx.doc_ole")
 local markdown = require("nvim-docx.markdown")
+local preserve = require("nvim-docx.preserve")
 
 local M = {}
 
@@ -52,7 +54,18 @@ end
 
 function M.docx_to_markdown_lines(docx_path, workspace)
   local opts = config.options or {}
-  utils.debug("Reading DOCX archive: " .. tostring(docx_path))
+  utils.debug("Reading DOCX/DOC archive: " .. tostring(docx_path))
+
+  if doc_ole.is_legacy_word_file(docx_path) then
+    local ast, ast_err = doc_ole.doc_to_ast(docx_path, workspace)
+    if not ast then
+      local err_msg = "Word document conversion failed: " .. tostring(ast_err)
+      utils.notify(err_msg, "error")
+      return nil, err_msg
+    end
+    local lines = markdown.ast_to_markdown_lines(ast, opts)
+    return lines, nil, nil, ast
+  end
 
   local archive, zip_err = zip.read_zip(docx_path)
   if not archive then
@@ -68,12 +81,25 @@ function M.docx_to_markdown_lines(docx_path, workspace)
     return nil, err_msg
   end
 
-  local lines = markdown.ast_to_markdown_lines(ast, opts)
-  return lines, nil, archive, ast
+  local ranges = {}
+  local lines = markdown.ast_to_markdown_lines(ast, vim.tbl_extend("force", opts, { block_ranges = ranges }))
+  return lines, nil, archive, ast, preserve.make_source(lines, ranges, ast)
+end
+
+-- Rebuild the block mapping source from an archive (after a save, without extracting media again)
+function M.source_from_archive(archive)
+  local opts = config.options or {}
+  local ast = ooxml.docx_to_ast(archive, nil, opts)
+  if not ast then
+    return nil
+  end
+  local ranges = {}
+  local lines = markdown.ast_to_markdown_lines(ast, vim.tbl_extend("force", opts, { block_ranges = ranges }))
+  return preserve.make_source(lines, ranges, ast)
 end
 
 function M.docx_to_markdown(docx_path, md_path, workspace)
-  local lines, err, archive, ast = M.docx_to_markdown_lines(docx_path, workspace)
+  local lines, err, archive, ast, source = M.docx_to_markdown_lines(docx_path, workspace)
   if not lines then
     return false, err
   end
@@ -85,28 +111,45 @@ function M.docx_to_markdown(docx_path, md_path, workspace)
     return false, err_msg
   end
 
-  return vim.fn.filereadable(md_path) == 1, nil, archive, ast
+  return vim.fn.filereadable(md_path) == 1, nil, archive, ast, source
 end
 
 function M.markdown_lines_to_docx(lines, docx_path, workspace, reference_doc, extra_opts)
-  local opts = vim.tbl_deep_extend("force", config.options or {}, extra_opts or {})
+  extra_opts = extra_opts or {}
+  -- Large objects are passed by reference, never deep-copied into the merged options
+  local ref_archive = extra_opts.reference_archive
+  local source = extra_opts.preserve_source
+  local plain_extra = vim.tbl_extend("force", {}, extra_opts)
+  plain_extra.reference_archive = nil
+  plain_extra.preserve_source = nil
+  local opts = vim.tbl_deep_extend("force", config.options or {}, plain_extra)
   local ws = workspace or utils.ensure_temp_dir()
   local temp_out = ws .. "/output_temp.docx"
 
   vim.fn.delete(temp_out)
 
-  local ok_parse, ast = pcall(markdown.markdown_to_ast, lines, opts)
+  local new_ranges = {}
+  local ok_parse, ast = pcall(markdown.markdown_to_ast, lines, vim.tbl_extend("force", opts, { block_ranges = new_ranges }))
   if not ok_parse or not ast then
     local err_msg = "Markdown parsing failed: " .. tostring(ast)
     utils.notify(err_msg, "error")
     return false, err_msg
   end
 
-  local ref_archive = extra_opts and extra_opts.reference_archive or nil
-  if not ref_archive and opts.preserve_styles and reference_doc and reference_doc ~= "" and vim.fn.filereadable(reference_doc) == 1 then
+  if not ref_archive and opts.preserve_styles and reference_doc and reference_doc ~= "" and vim.fn.filereadable(reference_doc) == 1 and not doc_ole.is_legacy_word_file(reference_doc) then
     ref_archive = zip.read_zip(reference_doc)
   elseif not opts.preserve_styles then
     ref_archive = nil
+  end
+
+  if ref_archive and source then
+    local ok_map, map = pcall(preserve.map_blocks, source, lines, new_ranges, ast.blocks)
+    if ok_map then
+      opts.preserve_source = source
+      opts.preserve_map = map
+    else
+      utils.debug("Block mapping failed, regenerating whole document: " .. tostring(map))
+    end
   end
 
   local ok_compile, new_archive = pcall(ooxml.ast_to_docx, ast, ws, ref_archive, opts)
@@ -159,6 +202,13 @@ function M.markdown_to_docx(md_path, docx_path, workspace, reference_doc, extra_
 end
 
 function M.get_docx_info(docx_path)
+  if doc_ole.is_legacy_word_file(docx_path) then
+    local ast, ast_err = doc_ole.doc_to_ast(docx_path, nil)
+    if not ast then
+      return nil, ast_err
+    end
+    return ooxml.get_docx_stats(nil, ast)
+  end
   local archive, err = zip.read_zip(docx_path)
   if not archive then
     return nil, err
