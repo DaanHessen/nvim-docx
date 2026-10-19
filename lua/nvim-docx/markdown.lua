@@ -182,7 +182,7 @@ function M.parse_inlines(str, fmt)
         pos = pos + 1
       end
 
-    -- 2. HTML <br> / <br/> or autolinks <https://...>
+    -- 2. HTML <br> / <br/>, <u>...</u>, or autolinks <https://...>
     elseif ch == "<" then
       local br_s, br_e = str:find("^<[bB][rR]%s*/?>", pos)
       if br_s then
@@ -190,24 +190,35 @@ function M.parse_inlines(str, fmt)
         out[#out + 1] = { type = "linebreak" }
         pos = br_e + 1
       else
-        local auto_s, auto_e, auto_url = str:find("^<(https?://[^>%s]+)>", pos)
-        if not auto_s then
-          auto_s, auto_e, auto_url = str:find("^<(mailto:[^>%s]+)>", pos)
-        end
-        if auto_s then
+        local u_s, u_e, u_inner = str:find("^<[uU]>(.-)</[uU]>", pos)
+        if u_s and u_inner ~= "" then
           flush_buf()
-          local link_text = clone_fmt(fmt)
-          link_text.type = "text"
-          link_text.text = auto_url:gsub("^mailto:", "")
-          out[#out + 1] = {
-            type = "link",
-            url = auto_url,
-            inlines = { link_text },
-          }
-          pos = auto_e + 1
+          local sub_fmt = clone_fmt(fmt)
+          sub_fmt.underline = true
+          for _, n in ipairs(M.parse_inlines(u_inner, sub_fmt)) do
+            out[#out + 1] = n
+          end
+          pos = u_e + 1
         else
-          buf[#buf + 1] = ch
-          pos = pos + 1
+          local auto_s, auto_e, auto_url = str:find("^<(https?://[^>%s]+)>", pos)
+          if not auto_s then
+            auto_s, auto_e, auto_url = str:find("^<(mailto:[^>%s]+)>", pos)
+          end
+          if auto_s then
+            flush_buf()
+            local link_text = clone_fmt(fmt)
+            link_text.type = "text"
+            link_text.text = auto_url:gsub("^mailto:", "")
+            out[#out + 1] = {
+              type = "link",
+              url = auto_url,
+              inlines = { link_text },
+            }
+            pos = auto_e + 1
+          else
+            buf[#buf + 1] = ch
+            pos = pos + 1
+          end
         end
       end
 
@@ -258,7 +269,7 @@ function M.parse_inlines(str, fmt)
         pos = pos + 1
       end
 
-    -- 5. Footnote ref [^id] or Link [label](url)
+    -- 5. Footnote ref [^id], Link [label](url), or Underlined span [label]{.underline}
     elseif ch == "[" then
       local fn_s, fn_e, fn_id = str:find("^%[%^([^%]%s]+)%]", pos)
       if fn_s and str:sub(fn_e + 1, fn_e + 1) ~= ":" then
@@ -288,6 +299,23 @@ function M.parse_inlines(str, fmt)
               inlines = child_inlines,
             }
             pos = paren_end + 1
+          else
+            buf[#buf + 1] = ch
+            pos = pos + 1
+          end
+        elseif label and bracket_end then
+          local u_attr_s, u_attr_e = str:find("^%{%.underline%}", bracket_end + 1)
+          if not u_attr_s then
+            u_attr_s, u_attr_e = str:find("^%{%.ul%}", bracket_end + 1)
+          end
+          if u_attr_s and label ~= "" then
+            flush_buf()
+            local sub_fmt = clone_fmt(fmt)
+            sub_fmt.underline = true
+            for _, n in ipairs(M.parse_inlines(label, sub_fmt)) do
+              out[#out + 1] = n
+            end
+            pos = u_attr_e + 1
           else
             buf[#buf + 1] = ch
             pos = pos + 1
@@ -475,7 +503,7 @@ local function format_text_span(node)
     return ""
   end
 
-  local has_style = node.bold or node.italic or node.strike or node.sup or node.sub
+  local has_style = node.bold or node.italic or node.strike or node.underline or node.sup or node.sub
 
   if node.code then
     local code_span
@@ -502,6 +530,10 @@ local function format_text_span(node)
     if node.strike then
       open_m = open_m .. "~~"
       close_m = "~~" .. close_m
+    end
+    if node.underline then
+      open_m = open_m .. "<u>"
+      close_m = "</u>" .. close_m
     end
     if node.sup then
       open_m = open_m .. "^"
@@ -537,6 +569,11 @@ local function format_text_span(node)
   if node.strike then
     open_m = open_m .. "~~"
     close_m = "~~" .. close_m
+  end
+
+  if node.underline then
+    open_m = open_m .. "<u>"
+    close_m = "</u>" .. close_m
   end
 
   if node.sup then

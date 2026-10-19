@@ -191,7 +191,8 @@ function M.emu_to_inches_str(emu)
     return nil
   end
   local inches = num / EMU_PER_INCH
-  return tostring(inches) .. "in"
+  local formatted = string.format("%.4f", inches):gsub("0+$", ""):gsub("%.$", "")
+  return formatted .. "in"
 end
 
 function M.resolve_dimensions_emu(image_bytes, width_str, height_str)

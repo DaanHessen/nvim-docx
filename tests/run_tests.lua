@@ -551,11 +551,17 @@ add_test("office_math_equations_roundtrip", function()
   }
   local ast = markdown.markdown_to_ast(md_input)
   local arch = ooxml.ast_to_docx(ast, test_dir, nil, {})
+  local doc_xml = arch.files["word/document.xml"]
+  assert_true(doc_xml:find("<m:nary>") ~= nil, "Generated structured <m:nary> integral element")
+  assert_true(doc_xml:find("<m:f>") ~= nil, "Generated structured <m:f> fraction element")
+  assert_true(doc_xml:find("<m:rad>") ~= nil, "Generated structured <m:rad> radical element")
+  assert_true(doc_xml:find("<m:sSup>") ~= nil, "Generated structured <m:sSup> superscript element")
+
   local rt_ast = ooxml.docx_to_ast(arch, test_dir, {})
   local rt_md = markdown.ast_to_markdown(rt_ast)
 
-  assert_true(rt_md:find("%$E = mc%^2%$") ~= nil, "Inline math preserved in roundtrip: " .. rt_md)
-  assert_true(rt_md:find("%$%$\n\\int_0%^\\infty") ~= nil, "Display math block preserved in roundtrip: " .. rt_md)
+  assert_true(rt_md:find("%$E = mc%^{2}%$") ~= nil, "Inline math preserved in roundtrip: " .. rt_md)
+  assert_true(rt_md:find("%$%$\n\\int_{0}%^{\\infty} e%^{%-x%^{2}} dx = \\frac{\\sqrt{\\pi}}{2}") ~= nil, "Display math block preserved in roundtrip: " .. rt_md)
 
   -- Also test structured OOXML math elements (<m:f>, <m:sSup>, <m:rad>)
   arch.files["word/document.xml"] = table.concat({
@@ -697,6 +703,63 @@ add_test("real_world_ooxml_quirks_roundtrip", function()
   local ole_arch, ole_err = zip.read_zip_bytes(ole2_bytes)
   assert_true(ole_arch == nil, "OLE2 binary .doc rejected")
   assert_true((ole_err or ""):find("OLE2") ~= nil, "OLE2 error mentions legacy .doc format: " .. tostring(ole_err))
+end)
+
+-- Test 21: AlternateContent, TextBoxes (txbxContent), SmartArt diagrams, w:sym, Underline, and Charts (<c:chart>)
+add_test("advanced_ooxml_containers_and_charts", function()
+  local md_u = markdown.markdown_to_ast({ "Testing <u>underlined</u> and [also underlined]{.underline} text." })
+  local arch_u = ooxml.ast_to_docx(md_u, test_dir, nil, {})
+  assert_true(arch_u.files["word/document.xml"]:find('<w:u w:val="single"/>') ~= nil, "<u> and {.underline} emit <w:u>")
+
+  local arch = ooxml.ast_to_docx(markdown.markdown_to_ast({ "Base" }), test_dir, nil, {})
+  arch.files["word/charts/chart1.xml"] = '<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart/></c:chartSpace>'
+  arch.files["word/diagrams/data1.xml"] = '<dgm:dataModel xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><dgm:ptLst><dgm:pt><dgm:t><a:p><a:r><a:t>SmartArt Node</a:t></a:r></a:p></dgm:t></dgm:pt></dgm:ptLst></dgm:dataModel>'
+  arch.files["word/_rels/document.xml.rels"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>',
+    '<Relationship Id="rId20" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="charts/chart1.xml"/>',
+    '<Relationship Id="rId21" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" Target="diagrams/data1.xml"/>',
+    '</Relationships>',
+  })
+  arch.files["word/document.xml"] = table.concat({
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" ',
+    'xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" ',
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ',
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ',
+    'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" ',
+    'xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" ',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">',
+    '<w:body>',
+      '<w:p><w:r>',
+        '<mc:AlternateContent>',
+          '<mc:Choice Requires="wps"><w:drawing><w:txbxContent><w:p><w:r><w:t>TextBox Caption</w:t></w:r></w:p></w:txbxContent></w:drawing></mc:Choice>',
+          '<mc:Fallback><w:pict><w:txbxContent><w:p><w:r><w:t>TextBox Caption</w:t></w:r></w:p></w:txbxContent></w:pict></mc:Fallback>',
+        '</mc:AlternateContent>',
+      '</w:r></w:p>',
+      '<w:p><w:r><w:sym w:font="Symbol" w:char="F0B1"/><w:softHyphen/><w:t>5</w:t></w:r></w:p>',
+      '<w:p><w:r><w:drawing><a:graphic><a:graphicData><dgm:relIds r:dm="rId21"/></a:graphicData></a:graphic></w:drawing></w:r></w:p>',
+      '<w:p><w:r><w:drawing><wp:inline><wp:extent cx="3657600" cy="1828800"/><wp:docPr id="1" name="Sales Chart"/><a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart"><c:chart r:id="rId20"/></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
+    '</w:body></w:document>',
+  })
+
+  local ast1 = ooxml.docx_to_ast(arch, test_dir, {})
+  local md1 = markdown.ast_to_markdown(ast1)
+  local _, count_tb = md1:gsub("TextBox Caption", "")
+  assert_equal(count_tb, 1, "AlternateContent extracted Choice without duplicating Fallback: " .. md1)
+  assert_true(md1:find("\194\177\194\1735") ~= nil, "w:sym (F0B1 -> ±) and w:softHyphen decoded: " .. md1)
+  assert_true(md1:find("SmartArt Node") ~= nil, "SmartArt diagram text extracted: " .. md1)
+  assert_true(md1:find('!%[Sales Chart%]%(charts/chart1%.xml%){width="4in" height="2in"}') ~= nil, "Embedded chart extracted with dimensions: " .. md1)
+
+  -- Round-trip chart back to DOCX and verify <c:chart> and chart1.xml survive
+  local ast2 = markdown.markdown_to_ast(vim.split(md1, "\n", { plain = true }))
+  local arch2 = ooxml.ast_to_docx(ast2, test_dir, arch, { preserve_styles = true })
+  assert_true(arch2.files["word/charts/chart1.xml"] ~= nil, "chart1.xml preserved in archive")
+  assert_true(arch2.files["word/document.xml"]:find("<c:chart ") ~= nil, "<c:chart> element emitted in document.xml")
+  local ast3 = ooxml.docx_to_ast(arch2, test_dir, {})
+  local md3 = markdown.ast_to_markdown(ast3)
+  assert_equal(md3, md1, "Full round-trip preserves chart, SmartArt text, TextBox text, and symbols")
 end)
 
 -- Main runner

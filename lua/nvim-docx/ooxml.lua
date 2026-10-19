@@ -13,6 +13,7 @@ local NS_R = "http://schemas.openxmlformats.org/officeDocument/2006/relationship
 local NS_WP = "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
 local NS_A = "http://schemas.openxmlformats.org/drawingml/2006/main"
 local NS_PIC = "http://schemas.openxmlformats.org/drawingml/2006/picture"
+local NS_C = "http://schemas.openxmlformats.org/drawingml/2006/chart"
 local NS_V = "urn:schemas-microsoft-com:vml"
 local NS_O = "urn:schemas-microsoft-com:office:office"
 local NS_M = "http://schemas.openxmlformats.org/officeDocument/2006/math"
@@ -25,6 +26,7 @@ local REL_NUMBERING = "http://schemas.openxmlformats.org/officeDocument/2006/rel
 local REL_FOOTNOTES = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/footnotes"
 local REL_ENDNOTES = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/endnotes"
 local REL_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+local REL_CHART = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
 local REL_HYPERLINK = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
 local REL_SETTINGS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings"
 local REL_WEB_SETTINGS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/webSettings"
@@ -45,6 +47,763 @@ local MONOSPACE_FONTS = {
   ["dejavu sans mono"] = true,
   ["source code pro"] = true,
 }
+
+local SYMBOL_FONT_MAP = {
+  [0x22] = "\226\136\128", -- ∀
+  [0x24] = "\226\136\131", -- ∃
+  [0x27] = "\226\136\141", -- ∋
+  [0x2A] = "\226\136\151", -- ∗
+  [0x2D] = "\226\136\146", -- −
+  [0x40] = "\226\137\133", -- ≅
+  [0x41] = "\206\145", [0x42] = "\206\146", [0x43] = "\206\167", [0x44] = "\206\148",
+  [0x45] = "\206\149", [0x46] = "\206\166", [0x47] = "\206\147", [0x48] = "\206\151",
+  [0x49] = "\206\153", [0x4A] = "\207\145", [0x4B] = "\206\154", [0x4C] = "\206\155",
+  [0x4D] = "\206\156", [0x4E] = "\206\157", [0x4F] = "\206\159", [0x50] = "\206\160",
+  [0x51] = "\206\152", [0x52] = "\206\161", [0x53] = "\206\163", [0x54] = "\206\164",
+  [0x55] = "\206\165", [0x56] = "\207\130", [0x57] = "\206\169", [0x58] = "\206\158",
+  [0x59] = "\206\168", [0x5A] = "\206\150",
+  [0x5C] = "\226\136\180", -- ∴
+  [0x5E] = "\226\159\130", -- ⊥
+  [0x61] = "\206\177", [0x62] = "\206\178", [0x63] = "\207\135", [0x64] = "\206\180",
+  [0x65] = "\206\181", [0x66] = "\207\134", [0x67] = "\206\179", [0x68] = "\206\183",
+  [0x69] = "\206\185", [0x6A] = "\207\149", [0x6B] = "\206\186", [0x6C] = "\206\187",
+  [0x6D] = "\206\188", [0x6E] = "\206\189", [0x6F] = "\206\191", [0x70] = "\207\128",
+  [0x71] = "\206\184", [0x72] = "\207\129", [0x73] = "\207\131", [0x74] = "\207\132",
+  [0x75] = "\207\133", [0x76] = "\207\150", [0x77] = "\207\137", [0x78] = "\206\190",
+  [0x79] = "\207\136", [0x7A] = "\206\182",
+  [0xA3] = "\226\137\164", -- ≤
+  [0xA5] = "\226\136\158", -- ∞
+  [0xAB] = "\226\134\148", -- ↔
+  [0xAC] = "\226\134\144", -- ←
+  [0xAD] = "\226\134\145", -- ↑
+  [0xAE] = "\226\134\146", -- →
+  [0xAF] = "\226\134\147", -- ↓
+  [0xB0] = "\194\176",     -- °
+  [0xB1] = "\194\177",     -- ±
+  [0xB3] = "\226\137\165", -- ≥
+  [0xB4] = "\195\151",     -- ×
+  [0xB5] = "\226\136\157", -- ∝
+  [0xB6] = "\226\136\130", -- ∂
+  [0xB7] = "\226\128\162", -- •
+  [0xB8] = "\195\183",     -- ÷
+  [0xB9] = "\226\137\160", -- ≠
+  [0xBA] = "\226\137\161", -- ≡
+  [0xBB] = "\226\137\136", -- ≈
+  [0xBC] = "\226\128\166", -- …
+  [0xC4] = "\226\138\151", -- ⊗
+  [0xC5] = "\226\138\149", -- ⊕
+  [0xC6] = "\226\136\133", -- ∅
+  [0xC7] = "\226\136\169", -- ∩
+  [0xC8] = "\226\136\170", -- ∪
+  [0xCC] = "\226\138\130", -- ⊂
+  [0xCD] = "\226\138\134", -- ⊆
+  [0xCE] = "\226\136\136", -- ∈
+  [0xCF] = "\226\136\137", -- ∉
+  [0xD1] = "\226\136\135", -- ∇
+  [0xD2] = "\194\174",     -- ®
+  [0xD3] = "\194\169",     -- ©
+  [0xD4] = "\226\132\162", -- ™
+  [0xD5] = "\226\136\143", -- ∏
+  [0xD6] = "\226\136\154", -- √
+  [0xD7] = "\226\139\133", -- ⋅
+  [0xD8] = "\194\172",     -- ¬
+  [0xD9] = "\226\136\167", -- ∧
+  [0xDA] = "\226\136\168", -- ∨
+  [0xDB] = "\226\135\148", -- ⇔
+  [0xDC] = "\226\135\144", -- ⇐
+  [0xDD] = "\226\135\145", -- ⇑
+  [0xDE] = "\226\135\146", -- ⇒
+  [0xDF] = "\226\135\147", -- ⇓
+  [0xE5] = "\226\136\145", -- ∑
+  [0xF2] = "\226\136\171", -- ∫
+}
+
+local function utf8_from_codepoint(cp)
+  if not cp or cp < 0 or cp > 0x10FFFF then
+    return ""
+  end
+  if cp <= 0x7F then
+    return string.char(cp)
+  elseif cp <= 0x7FF then
+    return string.char(0xC0 + math.floor(cp / 64), 0x80 + (cp % 64))
+  elseif cp <= 0xFFFF then
+    return string.char(
+      0xE0 + math.floor(cp / 4096),
+      0x80 + (math.floor(cp / 64) % 64),
+      0x80 + (cp % 64)
+    )
+  else
+    return string.char(
+      0xF0 + math.floor(cp / 262144),
+      0x80 + (math.floor(cp / 4096) % 64),
+      0x80 + (math.floor(cp / 64) % 64),
+      0x80 + (cp % 64)
+    )
+  end
+end
+
+local function decode_w_sym(font, char_hex)
+  if not char_hex or char_hex == "" then
+    return ""
+  end
+  local cp = tonumber(char_hex, 16)
+  if not cp then
+    return ""
+  end
+  local low = (cp >= 0xF000 and cp <= 0xF0FF) and (cp - 0xF000) or cp
+  local fl = (font or ""):lower()
+  if fl == "symbol" then
+    if SYMBOL_FONT_MAP[low] then
+      return SYMBOL_FONT_MAP[low]
+    elseif low >= 0x20 and low <= 0x7E then
+      return string.char(low)
+    end
+  end
+  return utf8_from_codepoint(cp)
+end
+
+local LATEX_NARY_SYMBOLS = {
+  ["int"] = "\226\136\171",    -- ∫
+  ["iint"] = "\226\136\172",   -- ∬
+  ["iiint"] = "\226\136\173",  -- ∭
+  ["oint"] = "\226\136\174",   -- ∮
+  ["sum"] = "\226\136\145",    -- ∑
+  ["prod"] = "\226\136\143",   -- ∏
+  ["coprod"] = "\226\136\144", -- ∐
+  ["bigcup"] = "\226\139\131", -- ⋃
+  ["bigcap"] = "\226\139\130", -- ⋂
+}
+
+local LATEX_MATH_SYMBOLS = {
+  ["alpha"] = "\206\177",
+  ["beta"] = "\206\178",
+  ["gamma"] = "\206\179",
+  ["delta"] = "\206\180",
+  ["epsilon"] = "\207\181",
+  ["varepsilon"] = "\206\181",
+  ["zeta"] = "\206\182",
+  ["eta"] = "\206\183",
+  ["theta"] = "\206\184",
+  ["vartheta"] = "\207\145",
+  ["iota"] = "\206\185",
+  ["kappa"] = "\206\186",
+  ["lambda"] = "\206\187",
+  ["mu"] = "\206\188",
+  ["nu"] = "\206\189",
+  ["xi"] = "\206\190",
+  ["pi"] = "\207\128",
+  ["varpi"] = "\207\150",
+  ["rho"] = "\207\129",
+  ["varrho"] = "\207\177",
+  ["sigma"] = "\207\131",
+  ["varsigma"] = "\207\130",
+  ["tau"] = "\207\132",
+  ["upsilon"] = "\207\133",
+  ["phi"] = "\207\149",
+  ["varphi"] = "\207\134",
+  ["chi"] = "\207\135",
+  ["psi"] = "\207\136",
+  ["omega"] = "\207\137",
+  ["Gamma"] = "\206\147",
+  ["Delta"] = "\206\148",
+  ["Theta"] = "\206\152",
+  ["Lambda"] = "\206\155",
+  ["Xi"] = "\206\158",
+  ["Pi"] = "\206\160",
+  ["Sigma"] = "\206\163",
+  ["Upsilon"] = "\206\165",
+  ["Phi"] = "\206\166",
+  ["Psi"] = "\206\168",
+  ["Omega"] = "\206\169",
+  ["infty"] = "\226\136\158",
+  ["partial"] = "\226\136\130",
+  ["nabla"] = "\226\136\135",
+  ["forall"] = "\226\136\128",
+  ["exists"] = "\226\136\131",
+  ["emptyset"] = "\226\136\133",
+  ["varnothing"] = "\226\136\133",
+  ["pm"] = "\194\177",
+  ["mp"] = "\226\136\147",
+  ["times"] = "\195\151",
+  ["div"] = "\195\183",
+  ["cdot"] = "\226\139\133",
+  ["ast"] = "\226\136\151",
+  ["star"] = "\226\139\134",
+  ["circ"] = "\226\136\152",
+  ["bullet"] = "\226\128\162",
+  ["leq"] = "\226\137\164",
+  ["le"] = "\226\137\164",
+  ["geq"] = "\226\137\165",
+  ["ge"] = "\226\137\165",
+  ["neq"] = "\226\137\160",
+  ["ne"] = "\226\137\160",
+  ["approx"] = "\226\137\136",
+  ["equiv"] = "\226\137\161",
+  ["sim"] = "\226\136\188",
+  ["simeq"] = "\226\137\131",
+  ["cong"] = "\226\137\133",
+  ["propto"] = "\226\136\157",
+  ["in"] = "\226\136\136",
+  ["notin"] = "\226\136\137",
+  ["ni"] = "\226\136\141",
+  ["subset"] = "\226\138\130",
+  ["supset"] = "\226\138\131",
+  ["subseteq"] = "\226\138\134",
+  ["supseteq"] = "\226\138\135",
+  ["cup"] = "\226\136\170",
+  ["cap"] = "\226\136\169",
+  ["setminus"] = "\226\136\150",
+  ["to"] = "\226\134\146",
+  ["rightarrow"] = "\226\134\146",
+  ["leftarrow"] = "\226\134\144",
+  ["leftrightarrow"] = "\226\134\148",
+  ["Rightarrow"] = "\226\135\146",
+  ["Leftarrow"] = "\226\135\144",
+  ["Leftrightarrow"] = "\226\135\148",
+  ["mapsto"] = "\226\134\166",
+  ["ldots"] = "\226\128\166",
+  ["cdots"] = "\226\139\175",
+  ["dots"] = "\226\128\166",
+  ["vdots"] = "\226\139\174",
+  ["ddots"] = "\226\139\177",
+  ["aleph"] = "\226\132\181",
+  ["hbar"] = "\226\132\143",
+  ["ell"] = "\226\132\147",
+  ["Re"] = "\226\132\156",
+  ["Im"] = "\226\132\145",
+  ["angle"] = "\226\136\160",
+  ["perp"] = "\226\159\130",
+  ["parallel"] = "\226\136\165",
+  ["triangle"] = "\226\150\179",
+  ["oplus"] = "\226\138\149",
+  ["otimes"] = "\226\138\151",
+  ["neg"] = "\194\172",
+  ["land"] = "\226\136\167",
+  ["lor"] = "\226\136\168",
+}
+
+local UNICODE_MATH_TO_LATEX = {
+  ["\226\136\171"] = "\\int",
+  ["\226\136\172"] = "\\iint",
+  ["\226\136\173"] = "\\iiint",
+  ["\226\136\174"] = "\\oint",
+  ["\226\136\145"] = "\\sum",
+  ["\226\136\143"] = "\\prod",
+  ["\226\136\144"] = "\\coprod",
+  ["\226\139\131"] = "\\bigcup",
+  ["\226\139\130"] = "\\bigcap",
+  ["\206\177"] = "\\alpha",
+  ["\206\178"] = "\\beta",
+  ["\206\179"] = "\\gamma",
+  ["\206\180"] = "\\delta",
+  ["\207\181"] = "\\epsilon",
+  ["\206\181"] = "\\varepsilon",
+  ["\206\182"] = "\\zeta",
+  ["\206\183"] = "\\eta",
+  ["\206\184"] = "\\theta",
+  ["\207\145"] = "\\vartheta",
+  ["\206\185"] = "\\iota",
+  ["\206\186"] = "\\kappa",
+  ["\206\187"] = "\\lambda",
+  ["\206\188"] = "\\mu",
+  ["\206\189"] = "\\nu",
+  ["\206\190"] = "\\xi",
+  ["\207\128"] = "\\pi",
+  ["\207\150"] = "\\varpi",
+  ["\207\129"] = "\\rho",
+  ["\207\177"] = "\\varrho",
+  ["\207\131"] = "\\sigma",
+  ["\207\130"] = "\\varsigma",
+  ["\207\132"] = "\\tau",
+  ["\207\133"] = "\\upsilon",
+  ["\207\149"] = "\\phi",
+  ["\207\134"] = "\\varphi",
+  ["\207\135"] = "\\chi",
+  ["\207\136"] = "\\psi",
+  ["\207\137"] = "\\omega",
+  ["\206\147"] = "\\Gamma",
+  ["\206\148"] = "\\Delta",
+  ["\206\152"] = "\\Theta",
+  ["\206\155"] = "\\Lambda",
+  ["\206\158"] = "\\Xi",
+  ["\206\160"] = "\\Pi",
+  ["\206\163"] = "\\Sigma",
+  ["\206\165"] = "\\Upsilon",
+  ["\206\166"] = "\\Phi",
+  ["\206\168"] = "\\Psi",
+  ["\206\169"] = "\\Omega",
+  ["\226\136\158"] = "\\infty",
+  ["\226\136\130"] = "\\partial",
+  ["\226\136\135"] = "\\nabla",
+  ["\226\136\128"] = "\\forall",
+  ["\226\136\131"] = "\\exists",
+  ["\226\136\133"] = "\\emptyset",
+  ["\194\177"] = "\\pm",
+  ["\226\136\147"] = "\\mp",
+  ["\195\151"] = "\\times",
+  ["\195\183"] = "\\div",
+  ["\226\139\133"] = "\\cdot",
+  ["\226\136\151"] = "\\ast",
+  ["\226\139\134"] = "\\star",
+  ["\226\136\152"] = "\\circ",
+  ["\226\137\164"] = "\\leq",
+  ["\226\137\165"] = "\\geq",
+  ["\226\137\160"] = "\\neq",
+  ["\226\137\136"] = "\\approx",
+  ["\226\137\161"] = "\\equiv",
+  ["\226\136\188"] = "\\sim",
+  ["\226\137\131"] = "\\simeq",
+  ["\226\137\133"] = "\\cong",
+  ["\226\136\157"] = "\\propto",
+  ["\226\136\136"] = "\\in",
+  ["\226\136\137"] = "\\notin",
+  ["\226\136\141"] = "\\ni",
+  ["\226\138\130"] = "\\subset",
+  ["\226\138\131"] = "\\supset",
+  ["\226\138\134"] = "\\subseteq",
+  ["\226\138\135"] = "\\supseteq",
+  ["\226\136\170"] = "\\cup",
+  ["\226\136\169"] = "\\cap",
+  ["\226\136\150"] = "\\setminus",
+  ["\226\134\146"] = "\\to",
+  ["\226\134\144"] = "\\leftarrow",
+  ["\226\134\148"] = "\\leftrightarrow",
+  ["\226\135\146"] = "\\Rightarrow",
+  ["\226\135\144"] = "\\Leftarrow",
+  ["\226\135\148"] = "\\Leftrightarrow",
+  ["\226\134\166"] = "\\mapsto",
+  ["\226\128\166"] = "\\ldots",
+  ["\226\139\175"] = "\\cdots",
+  ["\226\139\174"] = "\\vdots",
+  ["\226\139\177"] = "\\ddots",
+  ["\226\132\181"] = "\\aleph",
+  ["\226\132\143"] = "\\hbar",
+  ["\226\132\147"] = "\\ell",
+  ["\226\132\156"] = "\\Re",
+  ["\226\132\145"] = "\\Im",
+  ["\226\136\160"] = "\\angle",
+  ["\226\159\130"] = "\\perp",
+  ["\226\136\165"] = "\\parallel",
+  ["\226\150\179"] = "\\triangle",
+  ["\226\138\149"] = "\\oplus",
+  ["\226\138\151"] = "\\otimes",
+  ["\194\172"] = "\\neg",
+  ["\226\136\167"] = "\\land",
+  ["\226\136\168"] = "\\lor",
+}
+
+local function omml_text_to_latex(s)
+  if not s or s == "" then
+    return ""
+  end
+  local out = {}
+  local i = 1
+  local n = #s
+  while i <= n do
+    local b = string.byte(s, i)
+    local clen = 1
+    if b >= 0xF0 then
+      clen = 4
+    elseif b >= 0xE0 then
+      clen = 3
+    elseif b >= 0xC0 then
+      clen = 2
+    end
+    local ch = s:sub(i, i + clen - 1)
+    local next_i = i + clen
+    local tex = UNICODE_MATH_TO_LATEX[ch]
+    if tex then
+      local next_ch = (next_i <= n) and s:sub(next_i, next_i) or ""
+      if next_ch:match("^[A-Za-z]$") then
+        out[#out + 1] = tex .. " "
+      else
+        out[#out + 1] = tex
+      end
+    else
+      out[#out + 1] = ch
+    end
+    i = next_i
+  end
+  return table.concat(out)
+end
+
+local function read_math_braced(s, pos)
+  if s:sub(pos, pos) ~= "{" then
+    return nil, pos
+  end
+  local depth = 1
+  local i = pos + 1
+  local n = #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "\\" then
+      i = i + 2
+    elseif c == "{" then
+      depth = depth + 1
+      i = i + 1
+    elseif c == "}" then
+      depth = depth - 1
+      if depth == 0 then
+        return s:sub(pos + 1, i - 1), i + 1
+      end
+      i = i + 1
+    else
+      i = i + 1
+    end
+  end
+  return s:sub(pos + 1), n + 1
+end
+
+local function read_math_bracket(s, pos)
+  if s:sub(pos, pos) ~= "[" then
+    return nil, pos
+  end
+  local depth = 1
+  local i = pos + 1
+  local n = #s
+  while i <= n do
+    local c = s:sub(i, i)
+    if c == "[" then
+      depth = depth + 1
+    elseif c == "]" then
+      depth = depth - 1
+      if depth == 0 then
+        return s:sub(pos + 1, i - 1), i + 1
+      end
+    end
+    i = i + 1
+  end
+  return s:sub(pos + 1), n + 1
+end
+
+local function read_math_script_arg(s, pos)
+  local n = #s
+  while pos <= n and s:sub(pos, pos):match("%s") do
+    pos = pos + 1
+  end
+  if pos > n then
+    return "", pos
+  end
+  local c = s:sub(pos, pos)
+  if c == "{" then
+    return read_math_braced(s, pos)
+  elseif c == "\\" then
+    local _, e_idx, cmd = s:find("^\\([A-Za-z]+)", pos)
+    if cmd then
+      local next_p = e_idx + 1
+      if cmd == "frac" then
+        while next_p <= n and s:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+        local g1, p1 = read_math_braced(s, next_p)
+        if g1 then
+          while p1 <= n and s:sub(p1, p1):match("%s") do p1 = p1 + 1 end
+          local g2, p2 = read_math_braced(s, p1)
+          if g2 then
+            return "\\frac{" .. g1 .. "}{" .. g2 .. "}", p2
+          end
+        end
+      elseif cmd == "sqrt" then
+        while next_p <= n and s:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+        local deg_str = nil
+        if s:sub(next_p, next_p) == "[" then
+          deg_str, next_p = read_math_bracket(s, next_p)
+          while next_p <= n and s:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+        end
+        local g1, p1 = read_math_braced(s, next_p)
+        if g1 then
+          if deg_str then
+            return "\\sqrt[" .. deg_str .. "]{" .. g1 .. "}", p1
+          end
+          return "\\sqrt{" .. g1 .. "}", p1
+        end
+      end
+      return "\\" .. cmd, next_p
+    end
+    return s:sub(pos, math.min(pos + 1, n)), math.min(pos + 2, n + 1)
+  else
+    return c, pos + 1
+  end
+end
+
+local function make_omath_run(text)
+  return xml.elem("m:r", nil, {
+    xml.elem("m:t", { ["xml:space"] = "preserve" }, { xml.text_node(text) }),
+  })
+end
+
+local function latex_to_omml_nodes(tex)
+  if not tex or tex == "" then
+    return {}
+  end
+
+  local atoms = {}
+  local i = 1
+  local n = #tex
+
+  while i <= n do
+    local c = tex:sub(i, i)
+    if c == "\\" then
+      local _, e_idx, cmd = tex:find("^\\([A-Za-z]+)", i)
+      if cmd then
+        local next_p = e_idx + 1
+        if cmd == "frac" then
+          while next_p <= n and tex:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+          local num_str, p1 = read_math_braced(tex, next_p)
+          if not num_str then
+            num_str, p1 = read_math_script_arg(tex, next_p)
+          end
+          while p1 <= n and tex:sub(p1, p1):match("%s") do p1 = p1 + 1 end
+          local den_str, p2 = read_math_braced(tex, p1)
+          if not den_str then
+            den_str, p2 = read_math_script_arg(tex, p1)
+          end
+          local num_nodes = latex_to_omml_nodes(num_str or "")
+          local den_nodes = latex_to_omml_nodes(den_str or "")
+          if #num_nodes == 0 then num_nodes = { make_omath_run("") } end
+          if #den_nodes == 0 then den_nodes = { make_omath_run("") } end
+          atoms[#atoms + 1] = {
+            kind = "elem",
+            node = xml.elem("m:f", nil, {
+              xml.elem("m:num", nil, num_nodes),
+              xml.elem("m:den", nil, den_nodes),
+            }),
+          }
+          i = p2
+        elseif cmd == "sqrt" then
+          while next_p <= n and tex:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+          local deg_str = nil
+          if tex:sub(next_p, next_p) == "[" then
+            deg_str, next_p = read_math_bracket(tex, next_p)
+            while next_p <= n and tex:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+          end
+          local body_str, p1 = read_math_braced(tex, next_p)
+          if not body_str then
+            body_str, p1 = read_math_script_arg(tex, next_p)
+          end
+          local body_nodes = latex_to_omml_nodes(body_str or "")
+          if #body_nodes == 0 then body_nodes = { make_omath_run("") } end
+          if deg_str and deg_str ~= "" then
+            atoms[#atoms + 1] = {
+              kind = "elem",
+              node = xml.elem("m:rad", nil, {
+                xml.elem("m:deg", nil, latex_to_omml_nodes(deg_str)),
+                xml.elem("m:e", nil, body_nodes),
+              }),
+            }
+          else
+            atoms[#atoms + 1] = {
+              kind = "elem",
+              node = xml.elem("m:rad", nil, {
+                xml.elem("m:radPr", nil, { xml.elem("m:degHide", { ["m:val"] = "1" }) }),
+                xml.elem("m:deg"),
+                xml.elem("m:e", nil, body_nodes),
+              }),
+            }
+          end
+          i = p1
+        elseif LATEX_NARY_SYMBOLS[cmd] then
+          local nary_chr = LATEX_NARY_SYMBOLS[cmd]
+          local p = next_p
+          local sub_str, sup_str = nil, nil
+          for _ = 1, 2 do
+            local sp = p
+            while sp <= n and tex:sub(sp, sp):match("%s") do sp = sp + 1 end
+            if sp <= n and tex:sub(sp, sp) == "_" and not sub_str then
+              sub_str, p = read_math_script_arg(tex, sp + 1)
+            elseif sp <= n and tex:sub(sp, sp) == "^" and not sup_str then
+              sup_str, p = read_math_script_arg(tex, sp + 1)
+            else
+              break
+            end
+          end
+          while p <= n and tex:sub(p, p):match("%s") do p = p + 1 end
+          -- Scan operand up to top-level '=', '<', '>' or end of expression
+          local op_start = p
+          local depth = 0
+          local op_end = n
+          local scan = p
+          while scan <= n do
+            local sc = tex:sub(scan, scan)
+            if sc == "\\" then
+              local _, ce, ccmd = tex:find("^\\([A-Za-z]+)", scan)
+              if ccmd then
+                if depth == 0 and (ccmd == "leq" or ccmd == "le" or ccmd == "geq" or ccmd == "ge" or ccmd == "neq" or ccmd == "ne" or ccmd == "approx" or ccmd == "equiv" or ccmd == "to" or ccmd == "rightarrow") then
+                  op_end = scan - 1
+                  break
+                end
+                scan = ce + 1
+              else
+                scan = scan + 2
+              end
+            elseif sc == "{" then
+              depth = depth + 1
+              scan = scan + 1
+            elseif sc == "}" then
+              if depth > 0 then depth = depth - 1 end
+              scan = scan + 1
+            elseif depth == 0 and (sc == "=" or sc == "<" or sc == ">") then
+              op_end = scan - 1
+              break
+            else
+              scan = scan + 1
+            end
+          end
+          while op_end >= op_start and tex:sub(op_end, op_end):match("%s") do
+            op_end = op_end - 1
+          end
+          local operand_str = tex:sub(op_start, op_end)
+          local nary_pr_children = {
+            xml.elem("m:chr", { ["m:val"] = nary_chr }),
+            xml.elem("m:limLoc", { ["m:val"] = "subSup" }),
+          }
+          if not sub_str then
+            nary_pr_children[#nary_pr_children + 1] = xml.elem("m:subHide", { ["m:val"] = "1" })
+          end
+          if not sup_str then
+            nary_pr_children[#nary_pr_children + 1] = xml.elem("m:supHide", { ["m:val"] = "1" })
+          end
+          local e_nodes = latex_to_omml_nodes(operand_str)
+          if #e_nodes == 0 then e_nodes = { make_omath_run("") } end
+          atoms[#atoms + 1] = {
+            kind = "elem",
+            node = xml.elem("m:nary", nil, {
+              xml.elem("m:naryPr", nil, nary_pr_children),
+              xml.elem("m:sub", nil, sub_str and latex_to_omml_nodes(sub_str) or {}),
+              xml.elem("m:sup", nil, sup_str and latex_to_omml_nodes(sup_str) or {}),
+              xml.elem("m:e", nil, e_nodes),
+            }),
+          }
+          i = op_end + 1
+        elseif LATEX_MATH_SYMBOLS[cmd] then
+          local sym = LATEX_MATH_SYMBOLS[cmd]
+          -- Skip single space after command if followed by letter
+          if next_p <= n and tex:sub(next_p, next_p) == " " and tex:sub(next_p + 1, next_p + 1):match("^[A-Za-z]$") then
+            next_p = next_p + 1
+          end
+          atoms[#atoms + 1] = { kind = "text", text = sym }
+          i = next_p
+        elseif cmd == "left" or cmd == "right" then
+          i = next_p
+        elseif cmd == "text" or cmd == "mathrm" or cmd == "mathbf" or cmd == "mathit" then
+          while next_p <= n and tex:sub(next_p, next_p):match("%s") do next_p = next_p + 1 end
+          local grp, p1 = read_math_braced(tex, next_p)
+          if grp then
+            atoms[#atoms + 1] = { kind = "text", text = grp }
+            i = p1
+          else
+            i = next_p
+          end
+        else
+          atoms[#atoms + 1] = { kind = "text", text = "\\" .. cmd }
+          i = next_p
+        end
+      else
+        -- Escaped punctuation like \{, \}, \, , \;
+        local esc = tex:sub(i + 1, i + 1)
+        if esc == "," or esc == ";" or esc == ":" or esc == "!" or esc == " " then
+          atoms[#atoms + 1] = { kind = "text", text = " " }
+        elseif esc ~= "" then
+          atoms[#atoms + 1] = { kind = "text", text = esc }
+        else
+          atoms[#atoms + 1] = { kind = "text", text = "\\" }
+        end
+        i = i + 2
+      end
+    elseif c == "_" or c == "^" then
+      local sub_str, sup_str = nil, nil
+      local p = i
+      for _ = 1, 2 do
+        local sp = p
+        while sp <= n and tex:sub(sp, sp):match("%s") do sp = sp + 1 end
+        if sp <= n and tex:sub(sp, sp) == "_" and not sub_str then
+          sub_str, p = read_math_script_arg(tex, sp + 1)
+        elseif sp <= n and tex:sub(sp, sp) == "^" and not sup_str then
+          sup_str, p = read_math_script_arg(tex, sp + 1)
+        else
+          break
+        end
+      end
+      -- Pop preceding non-whitespace atom as base
+      local base_nodes = nil
+      if #atoms > 0 and not (atoms[#atoms].kind == "text" and atoms[#atoms].text:match("^%s+$")) then
+        local last = table.remove(atoms)
+        if last.kind == "text" then
+          base_nodes = { make_omath_run(last.text) }
+        elseif last.kind == "group" then
+          base_nodes = last.nodes
+        else
+          base_nodes = { last.node }
+        end
+      else
+        base_nodes = { make_omath_run("") }
+      end
+
+      if sub_str and sup_str then
+        atoms[#atoms + 1] = {
+          kind = "elem",
+          node = xml.elem("m:sSubSup", nil, {
+            xml.elem("m:e", nil, base_nodes),
+            xml.elem("m:sub", nil, latex_to_omml_nodes(sub_str)),
+            xml.elem("m:sup", nil, latex_to_omml_nodes(sup_str)),
+          }),
+        }
+      elseif sup_str then
+        atoms[#atoms + 1] = {
+          kind = "elem",
+          node = xml.elem("m:sSup", nil, {
+            xml.elem("m:e", nil, base_nodes),
+            xml.elem("m:sup", nil, latex_to_omml_nodes(sup_str)),
+          }),
+        }
+      elseif sub_str then
+        atoms[#atoms + 1] = {
+          kind = "elem",
+          node = xml.elem("m:sSub", nil, {
+            xml.elem("m:e", nil, base_nodes),
+            xml.elem("m:sub", nil, latex_to_omml_nodes(sub_str)),
+          }),
+        }
+      end
+      i = p
+    elseif c == "{" then
+      local grp, next_p = read_math_braced(tex, i)
+      atoms[#atoms + 1] = { kind = "group", nodes = latex_to_omml_nodes(grp or "") }
+      i = next_p
+    else
+      atoms[#atoms + 1] = { kind = "text", text = c }
+      i = i + 1
+    end
+  end
+
+  -- Merge adjacent text atoms into <m:r><m:t> runs
+  local result = {}
+  local text_buf = {}
+  local function flush_text()
+    if #text_buf > 0 then
+      result[#result + 1] = make_omath_run(table.concat(text_buf))
+      text_buf = {}
+    end
+  end
+
+  for _, a in ipairs(atoms) do
+    if a.kind == "text" then
+      text_buf[#text_buf + 1] = a.text
+    elseif a.kind == "group" then
+      flush_text()
+      for _, gn in ipairs(a.nodes or {}) do
+        result[#result + 1] = gn
+      end
+    else
+      flush_text()
+      result[#result + 1] = a.node
+    end
+  end
+  flush_text()
+
+  if #result == 0 then
+    result[1] = make_omath_run(tex)
+  end
+  return result
+end
 
 local function is_bool_on(node)
   if not node then
@@ -550,7 +1309,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
     local lname = mnode.local_name
     if lname == "t" then
-      return xml.get_direct_text(mnode)
+      return omml_text_to_latex(xml.get_direct_text(mnode))
     elseif lname == "f" then
       local num = extract_omath_text(xml.find_child(mnode, "num"))
       local den = extract_omath_text(xml.find_child(mnode, "den"))
@@ -568,6 +1327,29 @@ function M.docx_to_ast(archive, workspace, opts)
       local sub = extract_omath_text(xml.find_child(mnode, "sub"))
       local sup = extract_omath_text(xml.find_child(mnode, "sup"))
       return base .. "_{" .. sub .. "}^{" .. sup .. "}"
+    elseif lname == "nary" then
+      local npr = xml.find_child(mnode, "naryPr")
+      local chr_node = npr and xml.find_child(npr, "chr") or nil
+      local chr_val = (chr_node and (xml.get_attr(chr_node, "m:val") or xml.get_attr(chr_node, "val"))) or "\226\136\171"
+      local chr_tex = UNICODE_MATH_TO_LATEX[chr_val] or omml_text_to_latex(chr_val)
+      local sub = extract_omath_text(xml.find_child(mnode, "sub"))
+      local sup = extract_omath_text(xml.find_child(mnode, "sup"))
+      local body = extract_omath_text(xml.find_child(mnode, "e"))
+      local res = chr_tex
+      if sub ~= "" then
+        res = res .. "_{" .. sub .. "}"
+      end
+      if sup ~= "" then
+        res = res .. "^{" .. sup .. "}"
+      end
+      if body ~= "" then
+        if not body:match("^%s") then
+          res = res .. " " .. body
+        else
+          res = res .. body
+        end
+      end
+      return res
     elseif lname == "rad" then
       local deg = extract_omath_text(xml.find_child(mnode, "deg")):gsub("^%s+", ""):gsub("%s+$", "")
       local base = extract_omath_text(xml.find_child(mnode, "e"))
@@ -613,6 +1395,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
 
     local r_embed = nil
+    local is_chart = false
     for _, blip in ipairs(xml.find_all(drawing_node, "blip")) do
       r_embed = xml.get_attr(blip, "r:embed") or xml.get_attr(blip, "r:link")
       if r_embed then break end
@@ -621,6 +1404,15 @@ function M.docx_to_ast(archive, workspace, opts)
       for _, imgdata in ipairs(xml.find_all(drawing_node, "imagedata")) do
         r_embed = xml.get_attr(imgdata, "r:id") or xml.get_attr(imgdata, "o:relid")
         if r_embed then break end
+      end
+    end
+    if not r_embed then
+      for _, ch in ipairs(xml.find_all(drawing_node, "chart")) do
+        r_embed = xml.get_attr(ch, "r:id")
+        if r_embed then
+          is_chart = true
+          break
+        end
       end
     end
 
@@ -652,6 +1444,15 @@ function M.docx_to_ast(archive, workspace, opts)
         local descr = xml.get_attr(cnv, "descr")
         if descr and descr ~= "" then
           alt = descr
+          break
+        end
+      end
+    end
+    if is_chart and alt == "" then
+      for _, doc_pr in ipairs(xml.find_all(drawing_node, "docPr")) do
+        local nm = xml.get_attr(doc_pr, "name")
+        if nm and nm ~= "" then
+          alt = nm
           break
         end
       end
@@ -836,85 +1637,161 @@ function M.docx_to_ast(archive, workspace, opts)
             end
           end
 
-          for _, rchild in ipairs(child.children or {}) do
-            local rlname = rchild.local_name
-            if rlname == "fldChar" then
-              local ftype = (xml.get_attr(rchild, "w:fldCharType") or ""):lower()
-              if ftype == "begin" then
-                field_stack[#field_stack + 1] = {
-                  state = "instr",
-                  instr = "",
-                  inlines = {},
-                }
-              elseif ftype == "separate" then
-                if #field_stack > 0 then
-                  field_stack[#field_stack].state = "result"
+          local function walk_r_children(rchildren)
+            for _, rchild in ipairs(rchildren or {}) do
+              local rlname = rchild.local_name
+              if rlname == "AlternateContent" then
+                local branch = xml.find_child(rchild, "Choice") or xml.find_child(rchild, "Fallback")
+                if branch then
+                  walk_r_children(branch.children)
                 end
-              elseif ftype == "end" then
-                close_field()
-              end
-            elseif rlname == "instrText" then
-              if #field_stack > 0 then
-                field_stack[#field_stack].instr = field_stack[#field_stack].instr .. xml.get_direct_text(rchild)
-              end
-            elseif rlname == "t" or (rlname == "delText" and in_del) then
-              local txt = xml.get_direct_text(rchild)
-              if txt ~= "" then
+              elseif rlname == "fldChar" then
+                local ftype = (xml.get_attr(rchild, "w:fldCharType") or ""):lower()
+                if ftype == "begin" then
+                  field_stack[#field_stack + 1] = {
+                    state = "instr",
+                    instr = "",
+                    inlines = {},
+                  }
+                elseif ftype == "separate" then
+                  if #field_stack > 0 then
+                    field_stack[#field_stack].state = "result"
+                  end
+                elseif ftype == "end" then
+                  close_field()
+                end
+              elseif rlname == "instrText" then
+                if #field_stack > 0 then
+                  field_stack[#field_stack].instr = field_stack[#field_stack].instr .. xml.get_direct_text(rchild)
+                end
+              elseif rlname == "t" or (rlname == "delText" and in_del) then
+                local txt = xml.get_direct_text(rchild)
+                if txt ~= "" then
+                  local node = vim.deepcopy(rfmt)
+                  node.type = "text"
+                  node.text = txt
+                  push_inline(node)
+                end
+              elseif rlname == "sym" then
+                local sym_font = xml.get_attr(rchild, "w:font")
+                local sym_char = xml.get_attr(rchild, "w:char")
+                local sym_txt = decode_w_sym(sym_font, sym_char)
+                if sym_txt ~= "" then
+                  local node = vim.deepcopy(rfmt)
+                  node.type = "text"
+                  node.text = sym_txt
+                  push_inline(node)
+                end
+              elseif rlname == "tab" then
+                if in_code_para then
+                  push_inline({ type = "text", text = "\t" })
+                else
+                  push_inline({ type = "tab" })
+                end
+              elseif rlname == "br" or rlname == "cr" then
+                local br_type = xml.get_attr(rchild, "w:type")
+                if br_type == "page" then
+                  found_hr = true
+                elseif in_code_para then
+                  push_inline({ type = "text", text = "\n" })
+                else
+                  push_inline({ type = "linebreak" })
+                end
+              elseif rlname == "noBreakHyphen" then
                 local node = vim.deepcopy(rfmt)
                 node.type = "text"
-                node.text = txt
+                node.text = "-"
                 push_inline(node)
-              end
-            elseif rlname == "tab" then
-              if in_code_para then
-                push_inline({ type = "text", text = "\t" })
-              else
-                push_inline({ type = "tab" })
-              end
-            elseif rlname == "br" or rlname == "cr" then
-              local br_type = xml.get_attr(rchild, "w:type")
-              if br_type == "page" then
-                found_hr = true
-              elseif in_code_para then
-                push_inline({ type = "text", text = "\n" })
-              else
-                push_inline({ type = "linebreak" })
-              end
-            elseif rlname == "noBreakHyphen" then
-              local node = vim.deepcopy(rfmt)
-              node.type = "text"
-              node.text = "-"
-              push_inline(node)
-            elseif rlname == "drawing" or rlname == "pict" then
-              local d = extract_run_drawing(rchild, active_rels)
-              if d then
-                if d.is_hr then
-                  found_hr = true
+              elseif rlname == "softHyphen" then
+                local node = vim.deepcopy(rfmt)
+                node.type = "text"
+                node.text = "\194\173"
+                push_inline(node)
+              elseif rlname == "drawing" or rlname == "pict" or rlname == "object" then
+                local txbx_list = xml.find_all(rchild, "txbxContent")
+                local dgm = xml.find_all(rchild, "relIds")[1]
+                if #txbx_list > 0 then
+                  for _, txbx in ipairs(txbx_list) do
+                    for _, tp in ipairs(xml.find_children(txbx, "p")) do
+                      local tpinl = extract_inlines_from_nodes(tp.children, false, nil, active_rels)
+                      if #tpinl > 0 then
+                        if #inlines > 0 and inlines[#inlines].type ~= "linebreak" then
+                          push_inline({ type = "linebreak" })
+                        end
+                        for _, item in ipairs(tpinl) do
+                          push_inline(item)
+                        end
+                      end
+                    end
+                  end
+                elseif dgm then
+                  local r_dm = xml.get_attr(dgm, "r:dm")
+                  local rel = r_dm and ((active_rels and active_rels[r_dm]) or doc_rels[r_dm]) or nil
+                  if rel and rel.target and rel.target ~= "" then
+                    local dgm_path = normalize_zip_path(doc_dir, rel.target)
+                    local dgm_raw = archive.files[dgm_path]
+                    local dgm_root = dgm_raw and xml.parse(dgm_raw) or nil
+                    if dgm_root then
+                      for _, pt in ipairs(xml.find_all(dgm_root, "pt")) do
+                        local dt = xml.find_child(pt, "t")
+                        if dt then
+                          for _, ap in ipairs(xml.find_children(dt, "p")) do
+                            local parts = {}
+                            for _, at in ipairs(xml.find_all(ap, "t")) do
+                              parts[#parts + 1] = xml.get_direct_text(at)
+                            end
+                            local ltxt = table.concat(parts):gsub("^%s+", ""):gsub("%s+$", "")
+                            if ltxt ~= "" then
+                              if #inlines > 0 and inlines[#inlines].type ~= "linebreak" then
+                                push_inline({ type = "linebreak" })
+                              end
+                              push_inline({ type = "text", text = ltxt })
+                            end
+                          end
+                        end
+                      end
+                    end
+                  end
                 else
-                  push_inline(d)
+                  local d = extract_run_drawing(rchild, active_rels)
+                  if d then
+                    if d.is_hr then
+                      found_hr = true
+                    else
+                      push_inline(d)
+                    end
+                  end
                 end
-              end
-            elseif rlname == "footnoteReference" then
-              local fn_id = xml.get_attr(rchild, "w:id")
-              if fn_id and tonumber(fn_id) and tonumber(fn_id) > 0 then
-                local disp = register_footnote_ref("fn", fn_id)
-                push_inline({ type = "footnote_ref", id = disp })
-              end
-            elseif rlname == "endnoteReference" then
-              local en_id = xml.get_attr(rchild, "w:id")
-              if en_id and tonumber(en_id) and tonumber(en_id) > 0 then
-                local disp = register_footnote_ref("en", en_id)
-                push_inline({ type = "footnote_ref", id = disp })
-              end
-            elseif rlname == "commentReference" then
-              if track_policy == "all" then
-                local cm_id = xml.get_attr(rchild, "w:id")
-                if cm_id and raw_comments[tostring(cm_id)] then
-                  local disp = register_footnote_ref("cm", cm_id)
+              elseif rlname == "footnoteReference" then
+                local fn_id = xml.get_attr(rchild, "w:id")
+                if fn_id and tonumber(fn_id) and tonumber(fn_id) > 0 then
+                  local disp = register_footnote_ref("fn", fn_id)
                   push_inline({ type = "footnote_ref", id = disp })
+                end
+              elseif rlname == "endnoteReference" then
+                local en_id = xml.get_attr(rchild, "w:id")
+                if en_id and tonumber(en_id) and tonumber(en_id) > 0 then
+                  local disp = register_footnote_ref("en", en_id)
+                  push_inline({ type = "footnote_ref", id = disp })
+                end
+              elseif rlname == "commentReference" then
+                if track_policy == "all" then
+                  local cm_id = xml.get_attr(rchild, "w:id")
+                  if cm_id and raw_comments[tostring(cm_id)] then
+                    local disp = register_footnote_ref("cm", cm_id)
+                    push_inline({ type = "footnote_ref", id = disp })
+                  end
                 end
               end
             end
+          end
+
+          walk_r_children(child.children)
+
+        elseif lname == "AlternateContent" then
+          local branch = xml.find_child(child, "Choice") or xml.find_child(child, "Fallback")
+          if branch then
+            walk_inline_children(branch.children, cur_fmt, in_del)
           end
 
         elseif lname == "commentReference" then
@@ -1036,7 +1913,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
     while #inlines > 0 do
       local first = inlines[1]
-      if first.type == "tab" then
+      if first.type == "tab" or first.type == "linebreak" then
         table.remove(inlines, 1)
       elseif trim_leading_spaces and first.type == "text" then
         first.text = (first.text or ""):gsub("^[ \t]+", "")
@@ -1051,7 +1928,7 @@ function M.docx_to_ast(archive, workspace, opts)
     end
     while #inlines > 0 do
       local last = inlines[#inlines]
-      if last.type == "tab" then
+      if last.type == "tab" or last.type == "linebreak" then
         table.remove(inlines, #inlines)
       elseif last.type == "text" then
         last.text = (last.text or ""):gsub("[ \t]+$", "")
@@ -1064,7 +1941,78 @@ function M.docx_to_ast(archive, workspace, opts)
         break
       end
     end
-    return inlines
+    -- Clean up spaces/tabs adjacent to interior linebreaks and collapse consecutive linebreaks
+    local i = 1
+    while i <= #inlines do
+      if inlines[i].type == "linebreak" then
+        -- Trim trailing spaces/tabs before linebreak
+        if i > 1 then
+          local prev = inlines[i - 1]
+          if prev.type == "tab" then
+            table.remove(inlines, i - 1)
+            i = i - 1
+          elseif prev.type == "text" then
+            prev.text = (prev.text or ""):gsub("[ \t]+$", "")
+            if prev.text == "" then
+              table.remove(inlines, i - 1)
+              i = i - 1
+            end
+          end
+        end
+        -- Trim leading spaces/tabs or duplicate linebreaks after linebreak
+        while i + 1 <= #inlines do
+          local nxt = inlines[i + 1]
+          if nxt.type == "linebreak" or nxt.type == "tab" then
+            table.remove(inlines, i + 1)
+          elseif nxt.type == "text" then
+            nxt.text = (nxt.text or ""):gsub("^[ \t]+", "")
+            if nxt.text == "" then
+              table.remove(inlines, i + 1)
+            else
+              break
+            end
+          else
+            break
+          end
+        end
+      end
+      i = i + 1
+    end
+    -- Re-check leading/trailing linebreak in case interior cleanup exposed one
+    while #inlines > 0 and (inlines[1].type == "linebreak" or inlines[1].type == "tab") do
+      table.remove(inlines, 1)
+    end
+    while #inlines > 0 and (inlines[#inlines].type == "linebreak" or inlines[#inlines].type == "tab") do
+      table.remove(inlines, #inlines)
+    end
+    return markdown.merge_inlines(inlines)
+  end
+
+  local function collect_paragraphs_recursive(container, out_paras)
+    out_paras = out_paras or {}
+    for _, c in ipairs((container and container.children) or {}) do
+      local cl = c.local_name
+      if cl == "p" then
+        out_paras[#out_paras + 1] = c
+      elseif cl == "sdt" then
+        local sc = xml.find_child(c, "sdtContent")
+        if sc then collect_paragraphs_recursive(sc, out_paras) end
+      elseif cl == "customXml" or cl == "smartTag" then
+        collect_paragraphs_recursive(c, out_paras)
+      elseif cl == "AlternateContent" then
+        local br = xml.find_child(c, "Choice") or xml.find_child(c, "Fallback")
+        if br then collect_paragraphs_recursive(br, out_paras) end
+      elseif cl == "ins" or cl == "moveTo" then
+        if track_policy ~= "reject" then
+          collect_paragraphs_recursive(c, out_paras)
+        end
+      elseif cl == "del" or cl == "moveFrom" then
+        if track_policy == "reject" or track_policy == "all" then
+          collect_paragraphs_recursive(c, out_paras)
+        end
+      end
+    end
+    return out_paras
   end
 
   local function parse_notes_file(path, target_table, tag_name, note_rels)
@@ -1078,7 +2026,7 @@ function M.docx_to_ast(archive, workspace, opts)
       local is_valid_id = fid and tonumber(fid) ~= nil and (tag_name == "comment" and tonumber(fid) >= 0 or tonumber(fid) > 0)
       if is_valid_id and ftype ~= "separator" and ftype ~= "continuationSeparator" then
         local note_inlines = {}
-        local paras = xml.find_children(fnode, "p")
+        local paras = collect_paragraphs_recursive(fnode)
         for pi, p in ipairs(paras) do
           local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false, nil, note_rels), true)
           for _, item in ipairs(pinl) do
@@ -1132,7 +2080,9 @@ function M.docx_to_ast(archive, workspace, opts)
       end
 
       local pbdr = xml.find_child(ppr, "pBdr")
-      if pbdr and xml.find_child(pbdr, "bottom") then
+      local btm = pbdr and xml.find_child(pbdr, "bottom") or nil
+      local btm_val = btm and (xml.get_attr(btm, "w:val") or ""):lower() or nil
+      if btm_val and btm_val ~= "" and btm_val ~= "none" and btm_val ~= "nil" then
         has_bottom_border = true
       end
     end
@@ -1280,49 +2230,75 @@ function M.docx_to_ast(archive, workspace, opts)
     local all_rows = {}
     local alignments = {}
 
+    local function collect_tc(tr_container, out_tcs)
+      out_tcs = out_tcs or {}
+      for _, c in ipairs((tr_container and tr_container.children) or {}) do
+        local cl = c.local_name
+        if cl == "tc" then
+          out_tcs[#out_tcs + 1] = c
+        elseif cl == "sdt" then
+          local sc = xml.find_child(c, "sdtContent")
+          if sc then collect_tc(sc, out_tcs) end
+        elseif cl == "customXml" or cl == "smartTag" then
+          collect_tc(c, out_tcs)
+        elseif cl == "AlternateContent" then
+          local br = xml.find_child(c, "Choice") or xml.find_child(c, "Fallback")
+          if br then collect_tc(br, out_tcs) end
+        elseif cl == "ins" or cl == "moveTo" then
+          if track_policy ~= "reject" then
+            collect_tc(c, out_tcs)
+          end
+        elseif cl == "del" or cl == "moveFrom" then
+          if track_policy == "reject" or track_policy == "all" then
+            collect_tc(c, out_tcs)
+          end
+        end
+      end
+      return out_tcs
+    end
+
     local function collect_tr(container)
       for _, child in ipairs(container.children or {}) do
-        if child.local_name == "tr" then
+        local cl = child.local_name
+        if cl == "tr" then
           local row_cells = {}
           local col_idx = 0
-          for _, tc in ipairs(child.children or {}) do
-            if tc.local_name == "tc" then
-              col_idx = col_idx + 1
-              local cell_inlines = {}
-              local paras = xml.find_children(tc, "p")
-              for pi, p in ipairs(paras) do
-                local ppr = xml.find_child(p, "pPr")
-                if ppr and not alignments[col_idx] then
-                  local jc = xml.find_child(ppr, "jc")
-                  if jc then
-                    local jval = (xml.get_attr(jc, "w:val") or ""):lower()
-                    if jval == "center" or jval == "right" or jval == "left" then
-                      alignments[col_idx] = jval
-                    end
-                  end
-                end
-                local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false), true)
-                if #pinl > 0 then
-                  if #cell_inlines > 0 then
-                    cell_inlines[#cell_inlines + 1] = { type = "linebreak" }
-                  end
-                  for _, item in ipairs(pinl) do
-                    cell_inlines[#cell_inlines + 1] = item
+          for _, tc in ipairs(collect_tc(child)) do
+            col_idx = col_idx + 1
+            local cell_inlines = {}
+            local paras = collect_paragraphs_recursive(tc)
+            for _, p in ipairs(paras) do
+              local ppr = xml.find_child(p, "pPr")
+              if ppr and not alignments[col_idx] then
+                local jc = xml.find_child(ppr, "jc")
+                if jc then
+                  local jval = (xml.get_attr(jc, "w:val") or ""):lower()
+                  if jval == "center" or jval == "right" or jval == "left" then
+                    alignments[col_idx] = jval
                   end
                 end
               end
-              row_cells[#row_cells + 1] = trim_inlines(markdown.merge_inlines(cell_inlines), true)
+              local pinl = trim_inlines(extract_inlines_from_nodes(p.children, false), true)
+              if #pinl > 0 then
+                if #cell_inlines > 0 then
+                  cell_inlines[#cell_inlines + 1] = { type = "linebreak" }
+                end
+                for _, item in ipairs(pinl) do
+                  cell_inlines[#cell_inlines + 1] = item
+                end
+              end
+            end
+            row_cells[#row_cells + 1] = trim_inlines(markdown.merge_inlines(cell_inlines), true)
 
-              -- Handle horizontal span <w:gridSpan w:val="N"/>
-              local tc_pr = xml.find_child(tc, "tcPr")
-              if tc_pr then
-                local gspan = xml.find_child(tc_pr, "gridSpan")
-                local span_n = gspan and tonumber(xml.get_attr(gspan, "w:val")) or 1
-                if span_n and span_n > 1 then
-                  for _ = 2, span_n do
-                    col_idx = col_idx + 1
-                    row_cells[#row_cells + 1] = {}
-                  end
+            -- Handle horizontal span <w:gridSpan w:val="N"/>
+            local tc_pr = xml.find_child(tc, "tcPr")
+            if tc_pr then
+              local gspan = xml.find_child(tc_pr, "gridSpan")
+              local span_n = gspan and tonumber(xml.get_attr(gspan, "w:val")) or 1
+              if span_n and span_n > 1 then
+                for _ = 2, span_n do
+                  col_idx = col_idx + 1
+                  row_cells[#row_cells + 1] = {}
                 end
               end
             end
@@ -1330,9 +2306,22 @@ function M.docx_to_ast(archive, workspace, opts)
           if #row_cells > 0 then
             all_rows[#all_rows + 1] = row_cells
           end
-        elseif child.local_name == "sdt" then
+        elseif cl == "sdt" then
           local sdt_c = xml.find_child(child, "sdtContent")
           if sdt_c then collect_tr(sdt_c) end
+        elseif cl == "customXml" or cl == "smartTag" then
+          collect_tr(child)
+        elseif cl == "AlternateContent" then
+          local br = xml.find_child(child, "Choice") or xml.find_child(child, "Fallback")
+          if br then collect_tr(br) end
+        elseif cl == "ins" or cl == "moveTo" then
+          if track_policy ~= "reject" then
+            collect_tr(child)
+          end
+        elseif cl == "del" or cl == "moveFrom" then
+          if track_policy == "reject" or track_policy == "all" then
+            collect_tr(child)
+          end
         end
       end
     end
@@ -1386,6 +2375,11 @@ function M.docx_to_ast(archive, workspace, opts)
         local sdt_content = xml.find_child(child, "sdtContent")
         if sdt_content then
           walk_body(sdt_content)
+        end
+      elseif lname == "AlternateContent" then
+        local branch = xml.find_child(child, "Choice") or xml.find_child(child, "Fallback")
+        if branch then
+          walk_body(branch)
         end
       elseif lname == "customXml" or lname == "smartTag" then
         walk_body(child)
@@ -1535,11 +2529,13 @@ local function ensure_required_styles(styles_xml_str)
   end
 
   local existing = {}
+  local style_nodes = {}
   local heading_ids = {}
   for _, snode in ipairs(xml.find_children(root, "style")) do
     local sid = xml.get_attr(snode, "w:styleId")
     if sid then
       existing[sid] = true
+      style_nodes[sid] = snode
       local name_node = xml.find_child(snode, "name")
       local sname = (name_node and xml.get_attr(name_node, "w:val") or sid):lower()
       local h_lvl = sname:match("^heading%s*([1-6])$") or sid:lower():match("^heading([1-6])$")
@@ -1549,8 +2545,25 @@ local function ensure_required_styles(styles_xml_str)
     end
   end
 
-  local def_root = xml.parse(default_styles_xml())
+  -- If Normal has no paragraph spacing and TextBody does (e.g. LibreOffice templates), inherit TextBody's spacing
+  local normal_node = style_nodes["Normal"]
+  local textbody_node = style_nodes["TextBody"]
   local modified = false
+  if normal_node and textbody_node then
+    local norm_ppr = xml.find_child(normal_node, "pPr")
+    local tb_ppr = xml.find_child(textbody_node, "pPr")
+    local tb_spacing = tb_ppr and xml.find_child(tb_ppr, "spacing") or nil
+    if tb_spacing and (not norm_ppr or not xml.find_child(norm_ppr, "spacing")) then
+      if not norm_ppr then
+        norm_ppr = xml.elem("w:pPr")
+        normal_node.children[#normal_node.children + 1] = norm_ppr
+      end
+      norm_ppr.children[#norm_ppr.children + 1] = vim.deepcopy(tb_spacing)
+      modified = true
+    end
+  end
+
+  local def_root = xml.parse(default_styles_xml())
   if def_root then
     for _, def_style in ipairs(xml.find_children(def_root, "style")) do
       local sid = xml.get_attr(def_style, "w:styleId")
@@ -1684,6 +2697,36 @@ local function build_drawing_element(r_id, pic_id, name, alt, cx, cy)
                 xml.elem("a:avLst"),
               }),
             }),
+          }),
+        }),
+      }),
+    }),
+  })
+end
+
+local function build_chart_drawing_element(r_id, chart_id, name, cx, cy)
+  cx = tostring(math.floor(tonumber(cx) or 4099560))
+  cy = tostring(math.floor(tonumber(cy) or 2059940))
+  chart_id = tostring(chart_id or 1)
+  name = name or ""
+
+  return xml.elem("w:drawing", nil, {
+    xml.elem("wp:inline", {
+      ["distT"] = "0",
+      ["distB"] = "0",
+      ["distL"] = "0",
+      ["distR"] = "0",
+    }, {
+      xml.elem("wp:extent", { ["cx"] = cx, ["cy"] = cy }),
+      xml.elem("wp:effectExtent", { ["l"] = "0", ["t"] = "0", ["r"] = "0", ["b"] = "0" }),
+      xml.elem("wp:docPr", { ["id"] = chart_id, ["name"] = name }),
+      xml.elem("wp:cNvGraphicFramePr"),
+      xml.elem("a:graphic", { ["xmlns:a"] = NS_A }, {
+        xml.elem("a:graphicData", { ["uri"] = NS_C }, {
+          xml.elem("c:chart", {
+            ["xmlns:c"] = NS_C,
+            ["xmlns:r"] = NS_R,
+            ["r:id"] = r_id,
           }),
         }),
       }),
@@ -1924,11 +2967,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         elements[#elements + 1] = xml.elem("w:r", nil, run_children)
 
       elseif item.type == "math" then
-        elements[#elements + 1] = xml.elem("m:oMath", nil, {
-          xml.elem("m:r", nil, {
-            xml.elem("m:t", nil, { xml.text_node(item.text or "") }),
-          }),
-        })
+        elements[#elements + 1] = xml.elem("m:oMath", nil, latex_to_omml_nodes(item.text or ""))
 
       elseif item.type == "linebreak" then
         elements[#elements + 1] = xml.elem("w:r", nil, { xml.elem("w:br") })
@@ -1951,22 +2990,39 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
         end
 
       elseif item.type == "image" then
-        local rid, cx, cy = resolve_and_embed_image(item)
-        if rid then
+        local isrc = item.src or ""
+        if isrc:match("^charts/.*%.xml$") or isrc:match("^word/charts/.*%.xml$") then
+          local chart_rel = isrc:gsub("^word/", "")
+          local chart_zip = "word/" .. chart_rel
+          if not archive.files[chart_zip] and reference_archive and reference_archive.files and reference_archive.files[chart_zip] then
+            archive.files[chart_zip] = reference_archive.files[chart_zip]
+            archive.order[#archive.order + 1] = chart_zip
+          end
+          local rid = add_rel(REL_CHART, chart_rel)
+          local cx, cy = image.resolve_dimensions_emu(nil, item.width, item.height)
           pic_counter = pic_counter + 1
-          local pic_name = vim.fn.fnamemodify(item.src or ("Picture " .. pic_counter), ":t")
-          local drawing = build_drawing_element(rid, pic_counter, pic_name, item.alt or "", cx, cy)
+          local chart_drawing = build_chart_drawing_element(rid, pic_counter, item.alt or "", cx, cy)
           elements[#elements + 1] = xml.elem("w:r", nil, {
-            xml.elem("w:rPr", nil, { xml.elem("w:noProof") }),
-            drawing,
+            chart_drawing,
           })
         else
-          -- Fallback text if image file does not exist
-          elements[#elements + 1] = xml.elem("w:r", nil, {
-            xml.elem("w:t", { ["xml:space"] = "preserve" }, {
-              xml.text_node(string.format("![%s](%s)", item.alt or "", item.src or "")),
-            }),
-          })
+          local rid, cx, cy = resolve_and_embed_image(item)
+          if rid then
+            pic_counter = pic_counter + 1
+            local pic_name = vim.fn.fnamemodify(item.src or ("Picture " .. pic_counter), ":t")
+            local drawing = build_drawing_element(rid, pic_counter, pic_name, item.alt or "", cx, cy)
+            elements[#elements + 1] = xml.elem("w:r", nil, {
+              xml.elem("w:rPr", nil, { xml.elem("w:noProof") }),
+              drawing,
+            })
+          else
+            -- Fallback text if image file does not exist
+            elements[#elements + 1] = xml.elem("w:r", nil, {
+              xml.elem("w:t", { ["xml:space"] = "preserve" }, {
+                xml.text_node(string.format("![%s](%s)", item.alt or "", item.src or "")),
+              }),
+            })
+          end
         end
 
       elseif item.type == "footnote_ref" then
@@ -2049,11 +3105,7 @@ function M.ast_to_docx(doc, workspace, reference_archive, opts)
     elseif btype == "math_block" then
       body_children[#body_children + 1] = xml.elem("w:p", nil, {
         xml.elem("m:oMathPara", nil, {
-          xml.elem("m:oMath", nil, {
-            xml.elem("m:r", nil, {
-              xml.elem("m:t", nil, { xml.text_node(block.text or "") }),
-            }),
-          }),
+          xml.elem("m:oMath", nil, latex_to_omml_nodes(block.text or "")),
         }),
       })
 
